@@ -11,6 +11,7 @@ krilla = { version = "=0.8.2", features = ["pdf"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde.workspace = true
 rustybuzz = "0.20"
+ttf-parser = "0.25"
 
 [dev-dependencies]
 pdf-writer = "0.15"

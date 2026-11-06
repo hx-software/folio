@@ -1,76 +1,118 @@
 # Folio — numbering studio
 
 A local-first, web-based ticket and form numbering application. Application logic,
-UI, PDF rendering, PDF export, worker transport, storage integration, and build
-orchestration are authored in Rust.
+UI, PDF rendering, PDF export, worker transport, and storage integration are
+authored in Rust and built with the Dioxus CLI.
 
-**Stack:** Dioxus Web 0.7, Hayro 0.9, Krilla 0.8, WebAssembly, SVG, IndexedDB.
-No server, accounts, JavaScript PDF libraries, PDFium, or native C/C++ PDF engine.
+**Stack:** Dioxus Web 0.7 (built with `dx`), Hayro 0.9, Krilla 0.8, WebAssembly, SVG,
+IndexedDB. No server, accounts, JavaScript PDF libraries, PDFium, or native C/C++
+PDF engine.
 
 > **“No JS” boundary:** there are no handwritten JavaScript application files.
-> Dioxus, wasm-bindgen, and Trunk generate the browser runtime and loaders. The
-> deployed application does execute that generated JavaScript; Dioxus Web cannot
-> run with JavaScript disabled. HTML and CSS are maintained normally.
+> The Dioxus CLI and wasm-bindgen generate the browser runtime. The deployed
+> application does execute that generated JavaScript; Dioxus Web cannot run with
+> JavaScript disabled. CSS is maintained normally.
 
 ## Run
 
-Install [Rust/rustup](https://rustup.rs/), then install the pinned build tool:
+Install [Rust/rustup](https://rustup.rs/) (the pinned toolchain and WASM target are
+installed on first use) and the [Dioxus CLI](https://dioxuslabs.com/learn/0.7/getting_started/),
+**version 0.7.10** to match the `dioxus` crate:
 
 ```sh
-cargo install trunk --version 0.22.1 --locked
+cargo install dioxus-cli --version 0.7.10 --locked
 ```
 
 From this directory:
 
 ```sh
-cargo xtask serve --release
+dx serve --web
 ```
 
-Open **http://127.0.0.1:8080**. Rustup installs the pinned Rust toolchain and WASM
-target on first use. Trunk obtains the matching wasm-bindgen CLI automatically.
-The first build needs an internet connection; application operation does not
-upload files or require external services.
+Open **http://127.0.0.1:8080**. Edits hot-reload. The first build needs an internet
+connection: `dx` fetches the matching `wasm-bindgen` (and, for release builds,
+`wasm-opt`). Running the application does not upload files or need any service.
 
-Both the app and worker are built by Trunk from `index.html`. Worker loader code
-is generated, not maintained by the application. Do not edit generated files.
+`dx serve` builds with the `wasm-dev` profile in the workspace `Cargo.toml`, which
+keeps the PDF engine optimised and free of debug info (a plain debug build of this
+bundle is over 180 MB).
 
-For smaller/faster PDF work, use the release build even during UI development.
-If working on shared PDF/worker code, ensure both binaries have rebuilt before
-reloading. The release build command provides a clean, repeatable check.
+> On macOS, a prebuilt `dx` (for example from `cargo binstall`) links Homebrew's
+> OpenSSL. If it fails to start with a missing `libssl.3.dylib`, run
+> `brew install openssl@3`.
 
 ## Build and deploy
 
 ```sh
-cargo xtask build --release
+dx bundle --web --release
 ```
 
-Upload **the entire `dist/` directory** to a static host at the domain root.
-Serve `.wasm` files as `application/wasm`. Compression (Brotli/gzip) is strongly
-recommended for WASM and font assets.
+The static site is written to **`target/dx/numbering-app/release/web/public/`**:
+`index.html` plus hashed files in `assets/`. Upload that directory to any static
+host and serve `.wasm` as `application/wasm`. Use HTTPS in production.
 
-Root hosting is currently required: worker and font URLs are root-relative.
-Use HTTPS in production. Avoid long-lived caching for `index.html` and the
-unhashed `numbering-worker*.js` / `numbering-worker_bg.wasm` files; hashed app
-assets can be cached immutably. Keep worker files from the same deployment
-together. No cross-origin isolation headers are required: the worker is
-single-threaded and does not use shared WASM memory.
+- **Size:** the WASM bundle is about 10 MB (roughly 2.5 MB with Brotli, 3.9 MB with
+  gzip), so enable compression. It holds the UI *and* the PDF engine, because the
+  PDF worker runs the same bundle (see below). It is downloaded once, then cached.
+- **Caching:** asset names contain a content hash and can be cached immutably.
+  Do not cache `index.html` for long, and deploy all files together.
+- **Sub-paths:** to host below the domain root, set `base_path` under `[web.app]`
+  in `crates/app/Dioxus.toml` before bundling.
+- **Headers:** no cross-origin isolation headers are needed; the worker is
+  single-threaded and uses no shared memory.
+
+### How the PDF worker works
+
+All PDF work runs off the UI thread in a dedicated Web Worker. The worker is the
+**same bundle** as the UI: the app starts a module `Worker` from its own script
+(found via the `<script type="module">` that `dx` injects), and `main()` runs the
+worker loop when it finds no `window`. There is no second binary and no loader file
+to deploy. **Cancel operation** terminates the worker and starts a fresh one.
 
 ## Workflow
 
 1. Import a PDF, PNG, or JPEG, or number a blank sheet.
 2. Set the paper and grid. Each cell represents one numbered item.
-3. Configure the start, quantity, increment, padding, prefix, and suffix.
+3. Configure the start, quantity, increment, padding, prefix, suffix, and their spacing.
 4. Drag the number or enter precise cell-relative **baseline** coordinates.
 5. Use **Add** to place another field, for example on a matching ticket stub.
 6. Use **PDF proof** to inspect a page generated by the actual export pipeline.
 7. Download a PDF range and print using **actual size / 100%**, not fit-to-page.
+
+### Numbers, prefixes, and starting points
+
+- **Start at** is the project default. **Quantity**, **Increment**, and **Minimum
+  digits** are shared by every field.
+- Each field can have its **own Start number** (Field properties). Leave it blank to
+  follow the project's Start at. Fields in the same cell count the same items, so a
+  ticket and stub can both start at 1, or the stub can start at, say, 5001.
+- **Prefix spacing** and **Suffix spacing** (0–50 mm) add space between the prefix and
+  the number, and between the number and the suffix, on top of any space characters
+  in the text itself. Spacing is only applied when a prefix or suffix is present.
+- The largest number printed (start plus the whole run) must be at most
+  9,007,199,254,740,991; larger values are clamped or rejected with a clear message.
+
+### Typeface
+
+The bundled typeface is Noto Sans Regular. **Field properties → Import font…** loads
+a TrueType (`.ttf`), OpenType (`.otf`), or collection (`.ttc`, first face) file of up
+to 10 MiB. The font applies to all fields, is embedded and subset in exported PDFs,
+and is saved inside the project, so it travels with project backups.
+
+- The font must include the digits 0–9 and must allow embedding (its OS/2 `fsType`
+  must not restrict it). WOFF/WOFF2 files are not supported.
+- Variable fonts use their default instance. Characters missing from the font in a
+  prefix or suffix cause a clear export error instead of blank glyphs.
+- You are responsible for holding a licence that permits embedding the font in
+  documents you distribute. **Use default** returns to Noto Sans.
+- Font changes are not part of undo/redo, like artwork.
 
 ### Free placement and anchor guides
 
 Select **Sheet layout → Arrangement → Free placement** to work without grid cells.
 Positions are then measured from the page's top-left corner, and each field has
 a full-page horizontal and vertical guide through its baseline anchor. The
-selected field's guides are green; guides shared with another anchor are amber.
+selected fields' guides are green; guides shared with another anchor are amber.
 
 Drag another field within 6 screen pixels of a guide to snap its X or Y position.
 Each axis snaps independently (including to two different fields), with the same
@@ -92,7 +134,8 @@ an arrangement setting continue to open as Grid.
 Artwork is fitted proportionally and centred across the **whole sheet**. It is
 not automatically tiled into cells. PDF import initially adopts the selected
 page's visible dimensions; subsequent paper changes are preserved in saved
-projects. You can select another page in a multi-page source PDF.
+projects. You can select another page in a multi-page source PDF. After a
+successful import, the **Artwork & paper** section collapses to save space.
 
 ### Numbering order
 
@@ -109,14 +152,18 @@ stack across chunks before cutting.
 ### Editing
 
 - Click a number or its field-list entry to select it.
+- **Drag on empty space to draw a selection box**, like selecting desktop icons. Any
+  number the box touches is selected, live, while you drag. Hold Shift/Ctrl/Command
+  to add to the current selection. A plain click on empty space (or a box that
+  touches nothing) keeps only the primary field, because one field is always selected.
 - Shift/Ctrl/Command-click numbers or field-list entries to toggle multiple fields.
   The list also provides selection checkboxes and **Select all**.
 - Drag any selected occurrence to move the whole selection in every cell. Relative
   spacing is retained, including when the group reaches a page/cell boundary.
-- Size, colour, rotation, and alignment edits apply to all selected fields. Mixed
-  values are marked. X/Y show the primary field's anchor and translate the group,
-  rather than collapsing all anchors onto one position.
-- **Add** creates and selects a new field using the current field's styling.
+- Size, colour, rotation, alignment, and start-number edits apply to all selected
+  fields. Mixed values are marked. X/Y show the primary field's anchor and translate
+  the group, rather than collapsing all anchors onto one position.
+- **Add** creates and selects a new field copying the current field.
 - Snap to 0.5 mm can be disabled.
 - Focus the sheet and use arrow keys for 0.1 mm group nudges; Shift+arrow moves 1 mm.
   Ctrl/Command+A selects all fields; Escape returns to the primary field only.
@@ -124,19 +171,27 @@ stack across chunks before cutting.
 - Undo/redo keeps up to 50 layout changes. Artwork replacement clears history.
 - Rotation is clockwise in quarter turns; left, centre, and right alignment
   apply around the baseline anchor.
+- Click any sidebar section heading (or press Enter/Space on it) to collapse or
+  expand it. Collapsing keeps values intact; normal edits do not reopen a section.
 
 The live SVG overlay is for editing; browser text metrics may differ slightly.
 **PDF proof is the authoritative application preview.** Verify critical output
 with an independent PDF viewer and a physical print as well.
 
+The workspace fills the viewport. Only the two sidebars scroll; the whole sheet
+automatically fits the preview area and adjusts when the window or paper size
+changes. Preview scale can be reduced to 75% or 50% of that fit without introducing
+canvas scrolling. On narrow screens, **Settings** and **Fields** open the sidebars
+as scrollable drawers; close a drawer by clicking outside it or its button again.
+
 ## Projects and privacy
 
 - Valid projects autosave to IndexedDB after a short debounce.
 - The last project is restored on reload.
-- **Save project** downloads a versioned `.folio.json` file containing the
-  original artwork bytes and layout, not merely a reference to an external file.
-- The font is the bundled Noto Sans Regular asset, shared by the editor and PDF
-  exporter. Version 1 projects use that font; arbitrary font import is deferred.
+- **Save project** downloads a versioned `.folio.json` file containing the layout,
+  the original artwork, and any imported font, not references to external files.
+  Binary data is stored as base64; projects saved by earlier versions (number arrays)
+  still open, and settings added later default sensibly when missing.
 - **Open project** validates the schema and limits before replacing the current
   document. Unsupported schema versions are rejected, not silently converted.
 
@@ -149,10 +204,13 @@ for important jobs. Storage failures are displayed in the status bar.
 | Limit | Value |
 |---|---:|
 | Artwork file | 20 MiB |
+| Font file | 10 MiB |
 | Project file | 100 MiB |
 | Source raster image | 40 megapixels |
 | Page dimensions | 10–2,000 mm per axis |
 | Quantity | 100,000 items |
+| Largest printed number | 9,007,199,254,740,991 |
+| Prefix / suffix spacing | 0–50 mm |
 | Grid | Up to 20 × 20 |
 | Fields | 256, subject to per-sheet limit |
 | Number positions | 2,000 per sheet / 200,000 per export |
@@ -160,10 +218,9 @@ for important jobs. Storage failures are displayed in the status bar.
 | Raster preview | Approximately 4 megapixels maximum |
 | PDF operation deadline | 60 seconds |
 
-PDF work runs in a dedicated worker. Progress is reported while preparing export
-sheets; final serialization is a separate phase. **Cancel operation** immediately
-terminates the worker and starts a fresh one. Timeouts also terminate it. Late
-results are ignored, and proofs are invalidated when the layout changes.
+Progress is reported while preparing export sheets; final serialization is a
+separate phase. Timeouts also terminate the worker. Late results are ignored, and
+proofs are invalidated when the layout changes.
 
 The normal output is PDF 1.7; PDF 2.0 artwork requires PDF 2.0 output. PDF artwork
 is embedded as reusable Form XObjects, not converted into screenshots. Numbering
@@ -171,7 +228,8 @@ fonts are embedded and subsetted.
 
 ### Not implemented / not guaranteed
 
-- Duplex output, check digits, barcodes, crop marks, artwork tiling, and font import.
+- Duplex output, check digits, barcodes, crop marks, artwork tiling, and per-field
+  typefaces.
 - Offline installation/service worker or a PWA manifest.
 - Arbitrary design editing, cloud storage, collaboration, or project migrations
   beyond the initial schema.
@@ -181,62 +239,54 @@ fonts are embedded and subsetted.
 - PDF/X certification, spot-colour/overprint fidelity, or colour-accurate soft proofing.
 - Universal PDF compatibility or mobile-scale performance for large print jobs.
 
-Noto Sans Regular does not cover every script. Unsupported prefix/suffix glyphs
-cause an explicit export error rather than silently producing missing characters.
-Mixed-script/bidirectional numbering text is not a supported first-release feature.
-Anchor validation does not guarantee the entire rotated text remains inside a
-cell; inspect the proof for clipping or overlap.
+Mixed-script/bidirectional numbering text is not a supported feature. Anchor
+validation does not guarantee the entire rotated text remains inside a cell;
+inspect the proof for clipping or overlap.
 
 ## Development and tests
 
 ```sh
-cargo test --workspace
-cargo check -p numbering-app --target wasm32-unknown-unknown
+dx serve --web                                    # develop with hot reload
+cargo test --workspace                            # native unit and property tests
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 cargo fmt --all -- --check
-cargo xtask build --release
+dx bundle --web --release                         # the deployable static site
 ```
 
-Tests cover sequence completeness/uniqueness (including property tests),
-cut-and-stack gaps, ticket/stub matching, overflow, document validation,
-project round-trips, history, export dimensions, font errors, image import,
-PDF embedding, artwork reuse, progress, and rotated/cropped artwork rendering.
+Tests cover sequence completeness/uniqueness (including property tests), per-field
+starts, prefix/suffix spacing, cut-and-stack gaps, ticket/stub matching, overflow,
+document validation, project and binary-protocol round-trips (including legacy
+formats), history, selection, font validation and embedding, export dimensions,
+image import, PDF embedding, artwork reuse, progress, and rotated/cropped artwork.
 
 To write the source/embedded PNGs from the rotated-artwork regression test into
 an existing directory, set `FOLIO_TEST_ARTIFACTS` when running that test.
 
-Before a release, exercise the browser workflow in Chrome, Firefox, and Safari:
-drag/nudge, undo/redo, import each artwork format, select another PDF page,
-proof/export, project backup/open, reload restore, cancel/retry, and a narrow
-viewport. Check exported numbering and physical dimensions in an independent PDF
-reader. Test real print-shop artwork and actual printers before production use.
-
-The workspace fills the viewport. Only the two sidebars scroll; the whole sheet
-automatically fits the preview area and adjusts when the window or paper size
-changes. Preview scale can be reduced to 75% or 50% of that fit without introducing
-canvas scrolling. On narrow screens, **Settings** and **Fields** open the sidebars
-as scrollable drawers; close a drawer by clicking outside it or its button again.
-Click any sidebar section heading to collapse or expand its controls. Headings
-remain visible, and sections can also be toggled with Enter/Space when focused.
-Collapsing a section keeps its values intact; normal edits do not reopen it.
+Before a release, exercise the browser workflow in Chrome, Firefox, and Safari
+against **`dx bundle`'s output** (not only `dx serve`): drag/nudge, marquee
+selection, undo/redo, import each artwork format and a custom font, select another
+PDF page, proof/export, project backup/open, reload restore, cancel/retry, and a
+narrow viewport. Check exported numbering and physical dimensions in an independent
+PDF reader. Test real print-shop artwork and actual printers before production use.
 
 ### Workspace
 
 ```text
-crates/core/    Physical units, project schema, validation, imposition
-crates/pdf/     Hayro preview and Krilla vector export adapters
-crates/worker/  Binary protocol and Rust worker entrypoint
+crates/core/    Physical units, project schema, validation, numbering rules
+crates/pdf/     Hayro preview, Krilla export, font checks; bundled Noto Sans
+crates/worker/  Worker protocol, job dispatch, and the worker loop
 crates/app/     Dioxus UI, worker lifecycle, IndexedDB, downloads, history
-xtask/         Rust build-command wrapper
-public/        Bundled font and its license
+                (Dioxus.toml, assets/styles.css)
 ```
 
-There is no npm dependency or Node build step. `Cargo.lock` and the Rust/build-tool
-versions are pinned. The PDF implementation is isolated from the document and
-numbering model to contain upstream API changes.
+There is no npm dependency or Node build step. `Cargo.lock` and the Rust toolchain
+are pinned, and the Dioxus CLI version must match the `dioxus` crate. The PDF
+implementation is isolated from the document and numbering model to contain
+upstream API changes.
 
 ## Font license
 
 Noto Sans Regular is distributed under the SIL Open Font License 1.1. See
-[`public/FONT-LICENSE.txt`](public/FONT-LICENSE.txt). Its original source is the
-[`notofonts/noto-fonts`](https://github.com/notofonts/noto-fonts) repository.
+[`crates/pdf/assets/FONT-LICENSE.txt`](crates/pdf/assets/FONT-LICENSE.txt). Its
+original source is the [`notofonts/noto-fonts`](https://github.com/notofonts/noto-fonts)
+repository. It is compiled into the application, so no font file is served.

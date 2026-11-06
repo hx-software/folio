@@ -16,6 +16,22 @@ pub struct WorkerClient {
     _error: EventListener,
 }
 
+/// The URL of the app's own JavaScript module, as injected by the Dioxus CLI. Starting a
+/// module worker from it runs this same bundle, whose `main` then acts as the worker.
+fn bundle_url() -> Result<String, String> {
+    web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| {
+            document
+                .query_selector("script[type=module][src]")
+                .ok()
+                .flatten()
+        })
+        .and_then(|script| script.dyn_into::<web_sys::HtmlScriptElement>().ok())
+        .map(|script| script.src())
+        .ok_or_else(|| "Cannot locate the application bundle to start the PDF worker.".to_string())
+}
+
 fn post(worker: &Worker, request: &Request) -> Result<(), String> {
     let bytes = bincode::serialize(request).map_err(|e| e.to_string())?;
     let bytes = js_sys::Uint8Array::from(bytes.as_slice());
@@ -32,8 +48,8 @@ impl WorkerClient {
         error: impl Fn(String) + 'static,
     ) -> Result<Self, String> {
         let options = WorkerOptions::new();
-        options.set_type(WorkerType::Classic);
-        let worker = Worker::new_with_options("/numbering-worker_loader.js", &options)
+        options.set_type(WorkerType::Module);
+        let worker = Worker::new_with_options(&bundle_url()?, &options)
             .map_err(|e| format!("Cannot start PDF worker: {e:?}"))?;
         let ready = Rc::new(Cell::new(false));
         let queued = Rc::new(RefCell::new(None::<Request>));

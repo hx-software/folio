@@ -9,6 +9,13 @@ pub const MAX_PROJECT_BYTES: usize = 100 * 1024 * 1024;
 pub const MAX_EXPORT_SHEETS: usize = 500;
 pub const MAX_NUMBERS_PER_SHEET: usize = 2_000;
 pub const MAX_NUMBERS_PER_EXPORT: usize = 200_000;
+pub const MAX_FONT_BYTES: usize = 10 * 1024 * 1024;
+pub const MIN_ARTWORK_SCALE: f64 = 10.0;
+pub const MAX_ARTWORK_SCALE: f64 = 500.0;
+pub const MAX_ARTWORK_OFFSET_MM: f64 = 2000.0;
+pub const MAX_SPACING_MM: f64 = 50.0;
+/// Largest first number: every integer up to here is exact in the browser's numbers.
+pub const MAX_START: u64 = 9_007_199_254_740_991;
 pub const PT_PER_MM: f64 = 72.0 / 25.4;
 
 #[derive(Debug, thiserror::Error)]
@@ -16,6 +23,56 @@ pub const PT_PER_MM: f64 = 72.0 / 25.4;
 pub struct Error(pub String);
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Binary blobs are base64 in JSON (about a third of the size of a number array) and
+/// raw bytes in binary protocols. Older projects stored JSON number arrays; both load.
+mod bytes_format {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use serde::de::{self, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&STANDARD.encode(bytes))
+        } else {
+            serializer.serialize_bytes(bytes)
+        }
+    }
+
+    struct BytesVisitor;
+
+    impl<'de> Visitor<'de> for BytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("base64 text or bytes")
+        }
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Vec<u8>, E> {
+            STANDARD.decode(value).map_err(E::custom)
+        }
+        fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Vec<u8>, E> {
+            Ok(value.to_vec())
+        }
+        fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Vec<u8>, E> {
+            Ok(value)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1 << 20));
+            while let Some(byte) = seq.next_element::<u8>()? {
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_any(BytesVisitor)
+        } else {
+            deserializer.deserialize_byte_buf(BytesVisitor)
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +85,8 @@ pub struct Project {
     pub arrangement: Arrangement,
     pub grid: Grid,
     pub fields: Vec<NumberField>,
+    #[serde(default)]
+    pub font: Option<CustomFont>,
     pub artwork: Option<Artwork>,
 }
 
@@ -47,7 +106,16 @@ pub struct Sequence {
     pub padding: usize,
     pub prefix: String,
     pub suffix: String,
+    /// Extra space between the prefix and the number, in mm.
+    #[serde(default)]
+    pub prefix_spacing_mm: f64,
+    /// Extra space between the number and the suffix, in mm.
+    #[serde(default)]
+    pub suffix_spacing_mm: f64,
     pub order: Order,
+    /// Counts down: the same numbers are printed in the opposite order.
+    #[serde(default)]
+    pub reverse: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +154,9 @@ pub struct NumberField {
     pub rotation: Rotation,
     pub alignment: Alignment,
     pub color: String,
+    /// This field's own first number. `None` follows the project's "start at".
+    #[serde(default)]
+    pub start: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,8 +192,58 @@ pub enum Alignment {
 pub struct Artwork {
     pub name: String,
     pub kind: ArtworkKind,
+    #[serde(with = "bytes_format")]
     pub bytes: Vec<u8>,
     pub page_index: usize,
+    /// Size relative to the fitted sheet, in percent, scaled about the sheet's centre.
+    #[serde(default = "default_artwork_scale")]
+    pub scale_percent: f64,
+    /// Shift from the centred position, in mm (right and down are positive).
+    #[serde(default)]
+    pub offset_x_mm: f64,
+    #[serde(default)]
+    pub offset_y_mm: f64,
+}
+
+impl Artwork {
+    pub fn is_centered(&self) -> bool {
+        self.offset_x_mm == 0.0 && self.offset_y_mm == 0.0
+    }
+}
+
+fn default_artwork_scale() -> f64 {
+    100.0
+}
+
+/// A user-supplied TrueType/OpenType font, embedded in the project and exported PDFs.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomFont {
+    pub name: String,
+    /// CSS family used for browser preview. Always recomputed from the bytes on load.
+    pub family: String,
+    #[serde(with = "bytes_format")]
+    pub bytes: Vec<u8>,
+}
+
+impl CustomFont {
+    pub fn new(name: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            name: name.into(),
+            family: Self::family_for(&bytes),
+            bytes,
+        }
+    }
+
+    /// Content-addressed so two different fonts can never share a preview family.
+    pub fn family_for(bytes: &[u8]) -> String {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+        format!("folio-font-{hash:016x}")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,7 +256,11 @@ pub enum ArtworkKind {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlacedNumber {
     pub field: NumberField,
+    /// The complete text, for convenience and tests.
     pub text: String,
+    pub prefix: String,
+    pub digits: String,
+    pub suffix: String,
     pub x_mm: f64,
     pub y_mm: f64,
 }
@@ -156,7 +281,10 @@ impl Default for Project {
                 padding: 4,
                 prefix: "No. ".into(),
                 suffix: String::new(),
+                prefix_spacing_mm: 0.0,
+                suffix_spacing_mm: 0.0,
                 order: Order::Sequential,
+                reverse: false,
             },
             arrangement: Arrangement::Grid,
             grid: Grid {
@@ -173,7 +301,9 @@ impl Default for Project {
                 rotation: Rotation::Deg0,
                 alignment: Alignment::Left,
                 color: "#172b3a".into(),
+                start: None,
             }],
+            font: None,
             artwork: None,
         }
     }
@@ -204,14 +334,16 @@ impl Project {
             "Quantity must be 1–100,000.",
         )?;
         check(self.sequence.increment > 0, "Increment must be positive.")?;
-        self.sequence
-            .start
-            .checked_add(
-                (self.sequence.quantity - 1)
-                    .checked_mul(self.sequence.increment)
-                    .ok_or_else(|| Error("Sequence exceeds the integer limit.".into()))?,
-            )
+        let span = (self.sequence.quantity - 1)
+            .checked_mul(self.sequence.increment)
             .ok_or_else(|| Error("Sequence exceeds the integer limit.".into()))?;
+        check(
+            self.sequence
+                .start
+                .checked_add(span)
+                .is_some_and(|last| last <= MAX_START),
+            "Sequence exceeds the integer limit.",
+        )?;
         check(
             self.sequence.padding <= 20,
             "Padding cannot exceed 20 digits.",
@@ -228,6 +360,15 @@ impl Project {
                 .chain(self.sequence.suffix.chars())
                 .any(char::is_control),
             "Prefixes and suffixes cannot contain control characters.",
+        )?;
+        check(
+            [
+                self.sequence.prefix_spacing_mm,
+                self.sequence.suffix_spacing_mm,
+            ]
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=MAX_SPACING_MM).contains(v)),
+            "Prefix and suffix spacing must be between 0 and 50 mm.",
         )?;
         if self.arrangement == Arrangement::Grid {
             check(
@@ -273,13 +414,47 @@ impl Project {
                 parse_color(&field.color).is_some(),
                 "Invalid field colour; use #RRGGBB.",
             )?;
+            check(
+                field.start.is_none_or(|start| {
+                    start
+                        .checked_add(span)
+                        .is_some_and(|last| last <= MAX_START)
+                }),
+                "A field's start number is too large for this quantity and increment.",
+            )?;
         }
         if let Some(artwork) = &self.artwork {
+            check(
+                artwork.scale_percent.is_finite()
+                    && (MIN_ARTWORK_SCALE..=MAX_ARTWORK_SCALE).contains(&artwork.scale_percent),
+                "Artwork scale must be between 10% and 500%.",
+            )?;
+            check(
+                [artwork.offset_x_mm, artwork.offset_y_mm]
+                    .iter()
+                    .all(|v| v.is_finite() && v.abs() <= MAX_ARTWORK_OFFSET_MM),
+                "Artwork position must be within 2000 mm of the centre.",
+            )?;
             check(
                 !artwork.bytes.is_empty() && artwork.bytes.len() <= MAX_ARTWORK_BYTES,
                 "Artwork must be non-empty and no larger than 20 MB.",
             )?;
             check(artwork.name.len() <= 255, "Artwork filename is too long.")?;
+        }
+        if let Some(font) = &self.font {
+            check(
+                !font.bytes.is_empty() && font.bytes.len() <= MAX_FONT_BYTES,
+                "Font must be non-empty and no larger than 10 MB.",
+            )?;
+            check(font.name.len() <= 255, "Font filename is too long.")?;
+            check(
+                font.family.len() <= 40
+                    && font
+                        .family
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-'),
+                "Invalid font identifier.",
+            )?;
         }
         Ok(())
     }
@@ -313,6 +488,11 @@ impl Project {
     /// Row-major cell order. Cut-and-stack assumes sheets stacked in ascending order,
     /// then cut and gathered in that same cell order; unused tail positions stay blank.
     pub fn number_at(&self, sheet: usize, slot: usize) -> Option<u64> {
+        self.field_number(self.sequence.start, self.item_index(sheet, slot)?)
+    }
+
+    /// Which item (0-based, in numbering order) prints at a sheet position.
+    pub fn item_index(&self, sheet: usize, slot: usize) -> Option<u64> {
         if sheet >= self.sheet_count() || slot >= self.slots() {
             return None;
         }
@@ -320,12 +500,23 @@ impl Project {
             Order::Sequential => sheet.checked_mul(self.slots())?.checked_add(slot)?,
             Order::CutAndStack => slot.checked_mul(self.sheet_count())?.checked_add(sheet)?,
         } as u64;
-        if index >= self.sequence.quantity {
-            return None;
-        }
-        self.sequence
-            .start
-            .checked_add(index.checked_mul(self.sequence.increment)?)
+        (index < self.sequence.quantity).then_some(index)
+    }
+
+    /// The number printed for an item by a sequence starting at `start`. With
+    /// `reverse`, the same run of numbers is printed from the highest to the lowest.
+    pub fn field_number(&self, start: u64, index: u64) -> Option<u64> {
+        let index = if self.sequence.reverse {
+            self.sequence.quantity.checked_sub(1)?.checked_sub(index)?
+        } else {
+            index
+        };
+        start.checked_add(index.checked_mul(self.sequence.increment)?)
+    }
+
+    /// A field's own first number, or the project's when it has none.
+    pub fn field_start(&self, field: &NumberField) -> u64 {
+        field.start.unwrap_or(self.sequence.start)
     }
 
     pub fn format_number(&self, number: u64) -> String {
@@ -338,6 +529,15 @@ impl Project {
         )
     }
 
+    /// The prefix, zero-padded number, and suffix, in drawing order.
+    pub fn format_parts(&self, number: u64) -> (String, String, String) {
+        (
+            self.sequence.prefix.clone(),
+            format!("{:0width$}", number, width = self.sequence.padding.min(20)),
+            self.sequence.suffix.clone(),
+        )
+    }
+
     pub fn layout_sheet(&self, sheet: usize) -> Result<Vec<PlacedNumber>> {
         self.validate()?;
         if sheet >= self.sheet_count() {
@@ -346,7 +546,7 @@ impl Project {
         let (cell_width, cell_height) = self.cell_size();
         let mut result = Vec::new();
         for slot in 0..self.slots() {
-            let Some(number) = self.number_at(sheet, slot) else {
+            let Some(index) = self.item_index(sheet, slot) else {
                 continue;
             };
             let (origin_x, origin_y) = match self.arrangement {
@@ -361,9 +561,16 @@ impl Project {
                 Arrangement::Free => (0.0, 0.0),
             };
             for field in &self.fields {
+                let number = self
+                    .field_number(self.field_start(field), index)
+                    .ok_or_else(|| Error("A number exceeds the supported range.".into()))?;
+                let (prefix, digits, suffix) = self.format_parts(number);
                 result.push(PlacedNumber {
                     field: field.clone(),
                     text: self.format_number(number),
+                    prefix,
+                    digits,
+                    suffix,
                     x_mm: origin_x + field.x_mm,
                     y_mm: origin_y + field.y_mm,
                 });
@@ -381,8 +588,11 @@ impl Project {
         if bytes.len() > MAX_PROJECT_BYTES {
             return Err(Error("Project exceeds 100 MB.".into()));
         }
-        let project: Self =
+        let mut project: Self =
             serde_json::from_slice(bytes).map_err(|e| Error(format!("Invalid project: {e}")))?;
+        if let Some(font) = &mut project.font {
+            font.family = CustomFont::family_for(&font.bytes);
+        }
         project.validate()?;
         Ok(project)
     }
@@ -501,6 +711,244 @@ mod tests {
         assert_eq!(layout[0].text, layout[1].text);
         assert_ne!(layout[0].x_mm, layout[1].x_mm);
         assert_eq!(layout[2].text, "No. 0002");
+    }
+
+    #[test]
+    fn prefix_and_suffix_parts_and_spacing_are_validated() {
+        let mut p = Project::default();
+        p.sequence.suffix = " pcs".into();
+        p.sequence.prefix_spacing_mm = 2.5;
+        p.sequence.suffix_spacing_mm = 4.0;
+        let placed = &p.layout_sheet(0).unwrap()[0];
+        assert_eq!(
+            (&placed.prefix[..], &placed.digits[..], &placed.suffix[..]),
+            ("No. ", "0001", " pcs")
+        );
+        assert_eq!(placed.text, "No. 0001 pcs");
+        assert_eq!(Project::from_bytes(&p.to_bytes().unwrap()).unwrap(), p);
+        for bad in [-0.1, 50.1, f64::NAN, f64::INFINITY] {
+            let mut q = p.clone();
+            q.sequence.prefix_spacing_mm = bad;
+            assert!(q.validate().is_err(), "{bad}");
+            q = p.clone();
+            q.sequence.suffix_spacing_mm = bad;
+            assert!(q.validate().is_err(), "{bad}");
+        }
+        let mut legacy = serde_json::to_value(Project::default()).unwrap();
+        let sequence = legacy["sequence"].as_object_mut().unwrap();
+        sequence.remove("prefix_spacing_mm");
+        sequence.remove("suffix_spacing_mm");
+        let loaded = Project::from_bytes(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(loaded.sequence.prefix_spacing_mm, 0.0);
+        assert_eq!(loaded.sequence.suffix_spacing_mm, 0.0);
+    }
+
+    #[test]
+    fn blobs_use_base64_and_legacy_number_arrays_still_load() {
+        let mut p = Project::default();
+        p.artwork = Some(Artwork {
+            name: "a.png".into(),
+            kind: ArtworkKind::Png,
+            bytes: vec![0, 1, 2, 250, 255],
+            page_index: 0,
+            scale_percent: 100.0,
+            offset_x_mm: 0.0,
+            offset_y_mm: 0.0,
+        });
+        p.font = Some(CustomFont::new("font.ttf", vec![9, 8, 7, 6]));
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["artwork"]["bytes"], "AAEC+v8=");
+        assert!(json["font"]["bytes"].is_string());
+        assert_eq!(Project::from_bytes(&p.to_bytes().unwrap()).unwrap(), p);
+        let mut legacy = json;
+        legacy["artwork"]["bytes"] = serde_json::json!([0, 1, 2, 250, 255]);
+        let loaded = Project::from_bytes(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(loaded.artwork.unwrap().bytes, vec![0, 1, 2, 250, 255]);
+        let mut broken = serde_json::to_value(&p).unwrap();
+        broken["artwork"]["bytes"] = "not base64!".into();
+        assert!(Project::from_bytes(&serde_json::to_vec(&broken).unwrap()).is_err());
+    }
+
+    #[test]
+    fn custom_font_identity_is_recomputed_and_validated() {
+        let mut p = Project::default();
+        let font = CustomFont::new("a.ttf", vec![1, 2, 3]);
+        assert_ne!(font.family, CustomFont::new("b.ttf", vec![1, 2, 4]).family);
+        assert_eq!(font.family, CustomFont::new("c.ttf", vec![1, 2, 3]).family);
+        p.font = Some(font.clone());
+        p.validate().unwrap();
+        let mut json = serde_json::to_value(&p).unwrap();
+        json["font"]["family"] = "x'); } body { display:none".into();
+        let loaded = Project::from_bytes(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(loaded.font.unwrap().family, font.family);
+        p.font.as_mut().unwrap().family = "bad family".into();
+        assert!(p.validate().is_err());
+        p.font = Some(CustomFont::new("big.ttf", vec![0; MAX_FONT_BYTES + 1]));
+        assert!(p.validate().is_err());
+        p.font = Some(CustomFont::new("empty.ttf", vec![]));
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn fields_can_start_at_their_own_numbers() {
+        let mut p = Project::default();
+        p.sequence.start = 100;
+        p.sequence.increment = 5;
+        p.fields[0].start = Some(7000);
+        let mut stub = p.fields[0].clone();
+        stub.id = 2;
+        stub.start = None;
+        let mut third = stub.clone();
+        third.id = 3;
+        third.start = Some(0);
+        p.fields.extend([stub, third]);
+        let texts = |sheet: usize| -> Vec<String> {
+            p.layout_sheet(sheet)
+                .unwrap()
+                .into_iter()
+                .map(|n| n.text)
+                .collect()
+        };
+        assert_eq!(
+            texts(0)[..6],
+            [
+                "No. 7000", "No. 0100", "No. 0000", "No. 7005", "No. 0105", "No. 0005"
+            ]
+        );
+        let last_sheet = p.sheet_count() - 1;
+        assert_eq!(texts(last_sheet).len(), 3 * (100 % 6));
+        assert_eq!(p.field_start(&p.fields[0]), 7000);
+        assert_eq!(p.field_start(&p.fields[1]), 100);
+        // Every field covers its own range exactly once, in either numbering order.
+        for order in [Order::Sequential, Order::CutAndStack] {
+            p.sequence.order = order;
+            let mut seen: Vec<Vec<u64>> = vec![Vec::new(); 3];
+            for sheet in 0..p.sheet_count() {
+                for (i, placed) in p.layout_sheet(sheet).unwrap().iter().enumerate() {
+                    seen[i % 3].push(placed.digits.parse().unwrap());
+                }
+            }
+            for (field, mut numbers) in seen.into_iter().enumerate() {
+                numbers.sort_unstable();
+                let start = p.field_start(&p.fields[field]);
+                assert_eq!(numbers, (0..100).map(|i| start + i * 5).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    #[test]
+    fn field_starts_are_validated_and_legacy_projects_load() {
+        let mut p = Project::default();
+        p.fields[0].start = Some(MAX_START);
+        assert!(p.validate().is_err(), "quantity pushes it past the limit");
+        p.sequence.quantity = 1;
+        p.validate().unwrap();
+        p.fields[0].start = Some(MAX_START + 1);
+        assert!(p.validate().is_err());
+        p.fields[0].start = Some(u64::MAX);
+        assert!(p.validate().is_err());
+        p.fields[0].start = Some(5);
+        p.sequence.start = MAX_START + 1;
+        assert!(p.validate().is_err());
+        p.sequence.start = 1;
+        assert_eq!(Project::from_bytes(&p.to_bytes().unwrap()).unwrap(), p);
+        let mut legacy = serde_json::to_value(Project::default()).unwrap();
+        legacy["fields"][0].as_object_mut().unwrap().remove("start");
+        let loaded = Project::from_bytes(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(loaded.fields[0].start, None);
+    }
+
+    #[test]
+    fn reverse_prints_the_same_numbers_in_opposite_order() {
+        let mut p = Project::default();
+        p.sequence.quantity = 10;
+        p.sequence.start = 100;
+        p.sequence.increment = 5;
+        p.grid.columns = 2;
+        p.grid.rows = 2;
+        p.fields[0].start = Some(7000);
+        let mut stub = p.fields[0].clone();
+        stub.id = 2;
+        stub.start = None;
+        p.fields.push(stub);
+        let digits = |p: &Project| -> Vec<(u64, u64)> {
+            (0..p.sheet_count())
+                .flat_map(|sheet| p.layout_sheet(sheet).unwrap())
+                .map(|n| (n.field.id as u64, n.digits.parse().unwrap()))
+                .collect()
+        };
+        for order in [Order::Sequential, Order::CutAndStack] {
+            p.sequence.order = order;
+            p.sequence.reverse = false;
+            let forward = digits(&p);
+            p.sequence.reverse = true;
+            let backward = digits(&p);
+            assert_eq!(forward.len(), backward.len());
+            for (field, start) in [(1, 7000), (2, 100)] {
+                let pick = |all: &[(u64, u64)]| -> Vec<u64> {
+                    all.iter()
+                        .filter(|(f, _)| *f == field)
+                        .map(|(_, n)| *n)
+                        .collect()
+                };
+                let (a, b) = (pick(&forward), pick(&backward));
+                assert_eq!(a.len(), 10);
+                assert_eq!(a.first(), Some(&start));
+                assert_eq!(
+                    b.first(),
+                    Some(&(start + 45)),
+                    "first item gets the highest number"
+                );
+                if order == Order::Sequential {
+                    assert_eq!(b.last(), Some(&start), "last item gets the lowest");
+                }
+                let mirrored: Vec<u64> = a.iter().map(|n| 2 * start + 45 - n).collect();
+                assert_eq!(b, mirrored);
+            }
+        }
+        assert_eq!(p.number_at(0, 0), Some(145));
+        p.sequence.quantity = 1;
+        assert_eq!(p.number_at(0, 0), Some(100), "a single item is unaffected");
+        let mut legacy = serde_json::to_value(Project::default()).unwrap();
+        legacy["sequence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reverse");
+        let loaded = Project::from_bytes(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(!loaded.sequence.reverse);
+        assert_eq!(Project::from_bytes(&p.to_bytes().unwrap()).unwrap(), p);
+    }
+
+    #[test]
+    fn artwork_scale_is_validated_and_legacy_projects_load() {
+        let mut p = Project::default();
+        p.artwork = Some(Artwork {
+            name: "a.png".into(),
+            kind: ArtworkKind::Png,
+            bytes: vec![1],
+            page_index: 0,
+            scale_percent: 100.0,
+            offset_x_mm: 0.0,
+            offset_y_mm: 0.0,
+        });
+        p.validate().unwrap();
+        for ok in [MIN_ARTWORK_SCALE, 250.0, MAX_ARTWORK_SCALE] {
+            p.artwork.as_mut().unwrap().scale_percent = ok;
+            p.validate().unwrap();
+        }
+        for bad in [0.0, 9.9, 500.1, f64::NAN, f64::INFINITY] {
+            p.artwork.as_mut().unwrap().scale_percent = bad;
+            assert!(p.validate().is_err(), "{bad}");
+        }
+        p.artwork.as_mut().unwrap().scale_percent = 150.0;
+        assert_eq!(Project::from_bytes(&p.to_bytes().unwrap()).unwrap(), p);
+        let mut legacy = serde_json::to_value(&p).unwrap();
+        legacy["artwork"]
+            .as_object_mut()
+            .unwrap()
+            .remove("scale_percent");
+        let loaded = Project::from_bytes(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(loaded.artwork.unwrap().scale_percent, 100.0);
     }
 
     #[test]

@@ -8,12 +8,13 @@ use krilla::{
     text::{Font, TextDirection},
 };
 use numbering_core::{
-    Alignment, ArtworkKind, Error, MAX_EXPORT_SHEETS, PT_PER_MM, Project, Result, parse_color,
+    Alignment, ArtworkKind, Error, MAX_EXPORT_SHEETS, PT_PER_MM, PlacedNumber, Project, Result,
+    parse_color,
 };
 use serde::{Deserialize, Serialize};
 use std::{io::Cursor, ops::Range, sync::Arc};
 
-pub const FONT_BYTES: &[u8] = include_bytes!("../../../public/NotoSans-Regular.ttf");
+pub const FONT_BYTES: &[u8] = include_bytes!("../assets/NotoSans-Regular.ttf");
 const MAX_PREVIEW_PIXELS: f64 = 4_000_000.0;
 const MAX_IMAGE_PIXELS: u64 = 40_000_000;
 
@@ -32,8 +33,101 @@ pub struct Preview {
     pub height: u32,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FontInfo {
+    pub family: Option<String>,
+}
+
 fn err(message: impl ToString) -> Error {
     Error(message.to_string())
+}
+
+/// Checks that a user font can be shaped, subset, and legally embedded.
+pub fn inspect_font(bytes: &[u8]) -> Result<FontInfo> {
+    use ttf_parser::{Face, Permissions, name_id};
+    if bytes.is_empty() || bytes.len() > numbering_core::MAX_FONT_BYTES {
+        return Err(err("Font files must be between 1 byte and 10 MB."));
+    }
+    match bytes.get(..4) {
+        Some(magic)
+            if magic == [0_u8, 1, 0, 0]
+                || magic == b"OTTO"
+                || magic == b"true"
+                || magic == b"ttcf" => {}
+        Some(magic) if magic == b"wOFF" || magic == b"wOF2" => {
+            return Err(err(
+                "WOFF fonts are not supported. Use a TrueType (.ttf) or OpenType (.otf) file.",
+            ));
+        }
+        _ => {
+            return Err(err(
+                "Choose a TrueType (.ttf), OpenType (.otf), or collection (.ttc) font file.",
+            ));
+        }
+    }
+    let face = Face::parse(bytes, 0).map_err(|e| err(format!("Cannot read this font: {e}")))?;
+    if let Some(permissions) = face.permissions()
+        && (permissions == Permissions::Restricted || !face.is_subsetting_allowed())
+    {
+        return Err(err(
+            "This font's license does not allow it to be embedded in PDFs.",
+        ));
+    }
+    if ('0'..='9').any(|digit| face.glyph_index(digit).is_none()) {
+        return Err(err("This font does not include the digits 0–9."));
+    }
+    rustybuzz::Face::from_slice(bytes, 0)
+        .ok_or_else(|| err("Cannot shape text with this font."))?;
+    Font::new(bytes.to_vec().into(), 0)
+        .ok_or_else(|| err("This font cannot be embedded in a PDF."))?;
+    let family = face
+        .names()
+        .into_iter()
+        .filter(|name| name.name_id == name_id::FAMILY)
+        .find_map(|name| name.to_string());
+    Ok(FontInfo { family })
+}
+
+fn shape_width(face: &rustybuzz::Face, text: &str) -> Result<f64> {
+    let mut buffer = rustybuzz::UnicodeBuffer::new();
+    buffer.push_str(text);
+    buffer.guess_segment_properties();
+    let shaped = rustybuzz::shape(face, &[], buffer);
+    if shaped.glyph_infos().iter().any(|g| g.glyph_id == 0) {
+        return Err(err(
+            "The selected font does not support a character in your prefix, number, or suffix.",
+        ));
+    }
+    Ok(shaped
+        .glyph_positions()
+        .iter()
+        .map(|g| g.x_advance as f64)
+        .sum())
+}
+
+/// Splits a number into its drawn runs with their x offsets, and the total width, in pt.
+/// Spacing is added between the prefix/number and number/suffix, only when present.
+pub fn layout_runs(
+    face: &rustybuzz::Face,
+    number: &PlacedNumber,
+    project: &Project,
+) -> Result<(Vec<(String, f64)>, f64)> {
+    let scale = number.field.font_size_pt / face.units_per_em() as f64;
+    let mut cursor = 0.0;
+    let mut runs = Vec::new();
+    if !number.prefix.is_empty() {
+        runs.push((number.prefix.clone(), cursor));
+        cursor += shape_width(face, &number.prefix)? * scale
+            + project.sequence.prefix_spacing_mm * PT_PER_MM;
+    }
+    runs.push((number.digits.clone(), cursor));
+    cursor += shape_width(face, &number.digits)? * scale;
+    if !number.suffix.is_empty() {
+        cursor += project.sequence.suffix_spacing_mm * PT_PER_MM;
+        runs.push((number.suffix.clone(), cursor));
+        cursor += shape_width(face, &number.suffix)? * scale;
+    }
+    Ok((runs, cursor))
 }
 
 fn load_pdf(bytes: &[u8]) -> Result<hayro::hayro_syntax::Pdf> {
@@ -172,11 +266,14 @@ pub fn background(project: &Project, target_width: u32) -> Result<Preview> {
 pub fn fit_artwork(project: &Project, info: &ArtworkInfo) -> (f64, f64, f64, f64) {
     let scale =
         (project.page.width_mm / info.width_mm).min(project.page.height_mm / info.height_mm);
-    let w = info.width_mm * scale;
-    let h = info.height_mm * scale;
+    let (zoom, dx, dy) = project.artwork.as_ref().map_or((1.0, 0.0, 0.0), |a| {
+        (a.scale_percent / 100.0, a.offset_x_mm, a.offset_y_mm)
+    });
+    let w = info.width_mm * scale * zoom;
+    let h = info.height_mm * scale * zoom;
     (
-        (project.page.width_mm - w) / 2.0,
-        (project.page.height_mm - h) / 2.0,
+        (project.page.width_mm - w) / 2.0 + dx,
+        (project.page.height_mm - h) / 2.0 + dy,
         w,
         h,
     )
@@ -202,10 +299,11 @@ pub fn export_with_progress(
             "Too many number positions in one export. Reduce the sheet range to stay under 200,000 positions.",
         ));
     }
-    let font =
-        Font::new(FONT_BYTES.to_vec().into(), 0).ok_or_else(|| err("Bundled font is invalid."))?;
-    let face =
-        rustybuzz::Face::from_slice(FONT_BYTES, 0).ok_or_else(|| err("Cannot measure font."))?;
+    let font_bytes: &[u8] = project.font.as_ref().map_or(FONT_BYTES, |f| &f.bytes);
+    let font = Font::new(font_bytes.to_vec().into(), 0)
+        .ok_or_else(|| err("The selected font cannot be embedded."))?;
+    let face = rustybuzz::Face::from_slice(font_bytes, 0)
+        .ok_or_else(|| err("Cannot measure the selected font."))?;
     let artwork_info = project
         .artwork
         .as_ref()
@@ -269,22 +367,7 @@ pub fn export_with_progress(
             surface.pop();
         }
         for number in project.layout_sheet(sheet)? {
-            let mut buffer = rustybuzz::UnicodeBuffer::new();
-            buffer.push_str(&number.text);
-            buffer.guess_segment_properties();
-            let shaped = rustybuzz::shape(&face, &[], buffer);
-            if shaped.glyph_infos().iter().any(|g| g.glyph_id == 0) {
-                return Err(err(
-                    "The bundled Noto Sans font does not support a character in your prefix or suffix.",
-                ));
-            }
-            let width = shaped
-                .glyph_positions()
-                .iter()
-                .map(|g| g.x_advance as f64)
-                .sum::<f64>()
-                / face.units_per_em() as f64
-                * number.field.font_size_pt;
+            let (runs, width) = layout_runs(&face, &number, project)?;
             let offset = match number.field.alignment {
                 Alignment::Left => 0.0,
                 Alignment::Center => -width / 2.0,
@@ -305,14 +388,16 @@ pub fn export_with_progress(
                 pt(number.x_mm),
                 pt(number.y_mm),
             ));
-            surface.draw_text(
-                Point::from_xy(offset as f32, 0.0),
-                font.clone(),
-                number.field.font_size_pt as f32,
-                &number.text,
-                false,
-                TextDirection::LeftToRight,
-            );
+            for (run, run_offset) in &runs {
+                surface.draw_text(
+                    Point::from_xy((offset + run_offset) as f32, 0.0),
+                    font.clone(),
+                    number.field.font_size_pt as f32,
+                    run,
+                    false,
+                    TextDirection::LeftToRight,
+                );
+            }
             surface.pop();
         }
         surface.finish();
@@ -355,6 +440,9 @@ mod tests {
             kind: ArtworkKind::Pdf,
             bytes,
             page_index: 0,
+            scale_percent: 100.0,
+            offset_x_mm: 0.0,
+            offset_y_mm: 0.0,
         });
         let info = inspect_artwork(&p).unwrap();
         assert_eq!(info.page_count, 1);
@@ -374,6 +462,9 @@ mod tests {
             kind: ArtworkKind::Pdf,
             bytes: b"broken".to_vec(),
             page_index: 0,
+            scale_percent: 100.0,
+            offset_x_mm: 0.0,
+            offset_y_mm: 0.0,
         });
         assert!(inspect_artwork(&p).is_err());
     }
@@ -405,6 +496,9 @@ mod tests {
             kind: ArtworkKind::Pdf,
             bytes,
             page_index: 0,
+            scale_percent: 100.0,
+            offset_x_mm: 0.0,
+            offset_y_mm: 0.0,
         });
         let info = inspect_artwork(&p).unwrap();
         p.page.width_mm = info.width_mm;
@@ -455,6 +549,9 @@ mod tests {
             kind: ArtworkKind::Pdf,
             bytes,
             page_index: 0,
+            scale_percent: 100.0,
+            offset_x_mm: 0.0,
+            offset_y_mm: 0.0,
         });
         let one = export(&p, 0..1).unwrap();
         let mut progress = Vec::new();
@@ -490,6 +587,9 @@ mod tests {
                 },
                 bytes: bytes.into_inner(),
                 page_index: 0,
+                scale_percent: 100.0,
+                offset_x_mm: 0.0,
+                offset_y_mm: 0.0,
             });
             assert!(!background(&p, 200).unwrap().png.is_empty());
             assert!(!export(&p, 0..1).unwrap().is_empty());
@@ -502,5 +602,73 @@ mod tests {
                 .to_string()
                 .contains("does not support")
         );
+    }
+
+    #[test]
+    fn spacing_is_added_only_between_present_parts() {
+        let face = rustybuzz::Face::from_slice(FONT_BYTES, 0).unwrap();
+        let mut p = Project::default();
+        p.sequence.suffix = "pcs".into();
+        let placed = |p: &Project| p.layout_sheet(0).unwrap().remove(0);
+        let (base_runs, base_width) = layout_runs(&face, &placed(&p), &p).unwrap();
+        assert_eq!(base_runs.len(), 3);
+        p.sequence.prefix_spacing_mm = 3.0;
+        p.sequence.suffix_spacing_mm = 5.0;
+        let (runs, width) = layout_runs(&face, &placed(&p), &p).unwrap();
+        let prefix_gap = 3.0 * PT_PER_MM;
+        let suffix_gap = 5.0 * PT_PER_MM;
+        assert!((width - base_width - prefix_gap - suffix_gap).abs() < 1e-9);
+        assert!((runs[1].1 - base_runs[1].1 - prefix_gap).abs() < 1e-9);
+        assert!((runs[2].1 - base_runs[2].1 - prefix_gap - suffix_gap).abs() < 1e-9);
+        assert_eq!(runs[0].1, 0.0);
+        p.sequence.prefix.clear();
+        p.sequence.suffix.clear();
+        let (runs, width) = layout_runs(&face, &placed(&p), &p).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].1, 0.0);
+        let digits = layout_runs(&face, &placed(&Project::default()), &Project::default())
+            .unwrap()
+            .0[1]
+            .0
+            .clone();
+        assert_eq!(digits, "0001");
+        assert!(width > 0.0);
+        let mut export_project = Project::default();
+        export_project.sequence.suffix = " pcs".into();
+        export_project.sequence.prefix_spacing_mm = 4.0;
+        export_project.sequence.suffix_spacing_mm = 4.0;
+        assert!(export(&export_project, 0..1).unwrap().starts_with(b"%PDF-"));
+    }
+
+    #[test]
+    fn custom_fonts_are_validated_and_used_for_export() {
+        let info = inspect_font(FONT_BYTES).unwrap();
+        assert_eq!(info.family.as_deref(), Some("Noto Sans"));
+        for bad in [
+            &b""[..],
+            b"not a font at all",
+            b"wOFF\0\x01\0\0 rest of a web font",
+            b"OTTO but truncated",
+        ] {
+            assert!(inspect_font(bad).is_err());
+        }
+        assert!(
+            inspect_font(b"wOF2....")
+                .unwrap_err()
+                .to_string()
+                .contains("WOFF")
+        );
+        assert!(inspect_font(&vec![0; numbering_core::MAX_FONT_BYTES + 1]).is_err());
+        let mut p = Project::default();
+        p.font = Some(numbering_core::CustomFont::new(
+            "copy.ttf",
+            FONT_BYTES.to_vec(),
+        ));
+        assert!(export(&p, 0..1).unwrap().starts_with(b"%PDF-"));
+        p.font = Some(numbering_core::CustomFont::new(
+            "bad.ttf",
+            b"garbage".to_vec(),
+        ));
+        assert!(export(&p, 0..1).is_err());
     }
 }
