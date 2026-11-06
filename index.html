@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#153f39" />
+    <meta name="description" content="Private, local-first ticket and form numbering. Built in Rust." />
+    <title>Folio — precise numbering</title>
+    <link data-trunk rel="rust" href="crates/app/Cargo.toml" data-bin="numbering-app" data-wasm-opt="0" />
+    <link data-trunk rel="rust" href="crates/worker/Cargo.toml" data-bin="numbering-worker" data-type="worker" data-bindgen-target="no-modules" data-loader-shim data-wasm-opt="0" />
+    <link data-trunk rel="copy-dir" href="public" />
+    <link data-trunk rel="css" href="styles.css" />
+  </head>
+  <body><div id="main"></div><noscript>This Rust/WebAssembly application requires its generated browser runtime to be enabled.</noscript></body>
+</html>

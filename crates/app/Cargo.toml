@@ -1,0 +1,22 @@
+[package]
+name = "numbering-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+numbering-core.workspace = true
+numbering-worker.workspace = true
+dioxus = { version = "=0.7.10", default-features = false, features = ["minimal", "web", "logger"] }
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures = "0.4.80"
+js-sys.workspace = true
+bincode.workspace = true
+gloo-timers = { version = "0.3", features = ["futures"] }
+gloo-events = "0.2"
+base64 = "0.22"
+console_error_panic_hook = "0.1"
+futures-channel = "0.3"
+web-sys = { workspace = true, features = ["Window", "Document", "HtmlElement", "HtmlAnchorElement", "HtmlInputElement", "SvgElement", "Element", "DomRect", "Blob", "BlobPropertyBag", "Url", "File", "FileList", "Event", "IdbFactory", "IdbDatabase", "IdbOpenDbRequest", "IdbRequest", "IdbTransaction", "IdbTransactionMode", "IdbObjectStore", "DomException", "DomStringList", "EventTarget", "KeyboardEvent", "PointerEvent", "Worker", "WorkerOptions", "WorkerType", "MessageEvent"] }

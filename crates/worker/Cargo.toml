@@ -1,0 +1,15 @@
+[package]
+name = "numbering-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+numbering-core.workspace = true
+numbering-pdf.workspace = true
+serde.workspace = true
+bincode.workspace = true
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+web-sys = { workspace = true, features = ["DedicatedWorkerGlobalScope", "MessageEvent", "console"] }
+console_error_panic_hook = "0.1"
