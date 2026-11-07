@@ -66,6 +66,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           app=dist/desktop/Folio.app
+          codesign --verify --deep --strict --verbose=2 "$app"
           plist="$app/Contents/Info.plist"
           test "$(plutil -extract CFBundleIdentifier raw "$plist")" = com.hxsoftware.folio
           icon=$(plutil -extract CFBundleIconFile raw "$plist")

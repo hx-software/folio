@@ -23,3 +23,8 @@ webview_install_mode = { EmbedBootstrapper = { silent = true } }
 
 [bundle.windows.nsis]
 installer_icon = "icons/Folio.ico"
+
+[bundle.macos]
+# Seal the complete bundle after resources and Info.plist have been assembled.
+signing_identity = "-"
+hardened_runtime = false

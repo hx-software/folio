@@ -109,8 +109,10 @@ branch with the workflow changes and enter the tag in **release_tag**. Leave tha
 field blank to build and upload Actions artifacts without publishing.
 For public distribution, sign and notarize the
 macOS app and disk image with your Developer ID and sign the Windows executable
-and installer with your Authenticode credentials. The workflow produces builds
-without distribution signing credentials.
+and installer with your Authenticode credentials. The macOS bundle is sealed with an ad hoc signature, which is verified before
+upload. Downloaded macOS apps still require Developer ID signing and notarization
+to pass Gatekeeper’s default checks. The workflow produces builds without
+distribution signing credentials.
 
 ### How the PDF worker works
 
