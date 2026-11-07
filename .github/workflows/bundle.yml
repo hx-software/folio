@@ -2,6 +2,10 @@ name: Release bundles
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing v-prefixed tag to build and publish (blank for a test build)
+        type: string
   push:
     tags:
       - 'v*'
@@ -41,6 +45,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
       - uses: dtolnay/rust-toolchain@1.98.1
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux build and packaging dependencies
@@ -106,6 +112,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
       - uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: wasm32-unknown-unknown
@@ -122,3 +130,49 @@ jobs:
           name: folio-static-site
           path: dist/web/public/
           if-no-files-found: error
+
+  publish:
+    needs: [desktop, web]
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || startsWith(inputs.release_tag, 'v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ inputs.release_tag || github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: folio-*
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          shopt -s nullglob
+          installers=(
+            artifacts/folio-macos-arm64/*.dmg
+            artifacts/folio-macos-x64/*.dmg
+            artifacts/folio-windows-x64/*-setup.exe
+            artifacts/folio-linux-x64/*.deb
+            artifacts/folio-linux-x64/*.AppImage
+          )
+          test "${#installers[@]}" -eq 5
+          test -s artifacts/folio-static-site/index.html
+          web_zip="$PWD/folio-static-site.zip"
+          (cd artifacts/folio-static-site && zip -qr "$web_zip" .)
+
+          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft); then
+            if [[ "$draft" == true ]]; then
+              gh release upload "$RELEASE_TAG" --clobber "${installers[@]}" "$web_zip"
+              gh release edit "$RELEASE_TAG" --draft=false
+            else
+              echo "Release $RELEASE_TAG is already published."
+            fi
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --title "Folio $RELEASE_TAG" \
+              --generate-notes \
+              --notes 'The desktop packages were built without distribution signing. On Linux, run `chmod +x folio*.AppImage` before launching the AppImage.' \
+              "${installers[@]}" "$web_zip"
+          fi

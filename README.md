@@ -101,10 +101,13 @@ systems and use GTK 3 and WebKitGTK 4.1. After downloading the Linux workflow
 artifact, run `chmod +x folio*.AppImage` before launching the AppImage. The app
 itself runs locally after installation.
 
-The [Release bundles workflow](.github/workflows/bundle.yml) runs on demand and
-for `v*` tags. It uploads separate artifacts for Apple silicon, Intel macOS,
-x64 Windows, x64 Linux, and web. Download the artifacts from the workflow run
-to test and stage a release. For public distribution, sign and notarize the
+The [Release bundles workflow](.github/workflows/bundle.yml) builds installers
+for Apple silicon, Intel macOS, x64 Windows, and x64 Linux, plus a static web ZIP.
+A push to a `v*` tag publishes those downloads to GitHub Releases after every
+build succeeds. To publish an existing tag, run the workflow manually from a
+branch with the workflow changes and enter the tag in **release_tag**. Leave that
+field blank to build and upload Actions artifacts without publishing.
+For public distribution, sign and notarize the
 macOS app and disk image with your Developer ID and sign the Windows executable
 and installer with your Authenticode credentials. The workflow produces builds
 without distribution signing credentials.
