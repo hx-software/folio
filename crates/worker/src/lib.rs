@@ -124,9 +124,84 @@ pub fn run_worker() {
     send(&scope, WorkerEvent::Ready);
 }
 
+/// The native PDF worker, speaking a length-prefixed bincode protocol over stdin/stdout.
+///
+/// The desktop app starts its own executable with `--pdf-worker`, so the UI and the
+/// worker share one binary. Killing the child process cancels the job immediately.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn run_worker() {
-    eprintln!("The PDF worker only runs inside a browser Web Worker.");
+pub mod stdio {
+    use super::{Request, WorkerEvent, process};
+    use std::io::{self, Read, Write};
+
+    /// A generous ceiling that still rejects corrupt or hostile frame headers before
+    /// allocating memory. Exported PDFs can be much larger than the source artwork.
+    pub const MAX_FRAME_BYTES: usize = 512 * 1024 * 1024;
+
+    /// Writes one length-prefixed frame. The length is a little-endian `u32`.
+    pub fn write_frame(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+        let length = u32::try_from(bytes.len())
+            .ok()
+            .filter(|length| *length as usize <= MAX_FRAME_BYTES)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "PDF worker frame is too large.",
+                )
+            })?;
+        writer.write_all(&length.to_le_bytes())?;
+        writer.write_all(bytes)?;
+        writer.flush()
+    }
+
+    /// Reads one frame, returning `None` when the other end closes the stream cleanly.
+    pub fn read_frame(reader: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+        let mut header = [0_u8; 4];
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let length = u32::from_le_bytes(header) as usize;
+        if length > MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "PDF worker frame is too large.",
+            ));
+        }
+        let mut bytes = vec![0; length];
+        reader.read_exact(&mut bytes)?;
+        Ok(Some(bytes))
+    }
+
+    /// Runs the job loop until stdin closes. Progress and final responses are written
+    /// as separate `WorkerEvent` frames, matching the browser worker's message stream.
+    pub fn run_worker_stdio() -> io::Result<()> {
+        let stdin = io::stdin();
+        let mut reader = stdin.lock();
+        let stdout = io::stdout();
+        let mut writer = stdout.lock();
+        let ready = bincode::serialize(&WorkerEvent::Ready)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        write_frame(&mut writer, &ready)?;
+        while let Some(bytes) = read_frame(&mut reader)? {
+            let request = match bincode::deserialize::<Request>(&bytes) {
+                Ok(request) => request,
+                Err(error) => {
+                    eprintln!("Invalid PDF worker request: {error}");
+                    continue;
+                }
+            };
+            let response = process(request, |progress| {
+                if let Ok(bytes) = bincode::serialize(&WorkerEvent::Response(progress)) {
+                    let _ = write_frame(&mut writer, &bytes);
+                }
+            });
+            if let Ok(bytes) = bincode::serialize(&WorkerEvent::Response(response)) {
+                write_frame(&mut writer, &bytes)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -225,5 +300,49 @@ mod tests {
         });
         assert_eq!(response.id, 7);
         assert!(response.result.is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stdio_frames_round_trip_and_report_clean_eof() {
+        use std::io::Cursor;
+
+        let event = WorkerEvent::Response(Response {
+            id: 9,
+            result: Ok(Output::Exported(b"%PDF-1.7 stdio".to_vec())),
+        });
+        let payload = bincode::serialize(&event).unwrap();
+        let mut stream = Vec::new();
+        stdio::write_frame(&mut stream, &payload).unwrap();
+        stdio::write_frame(&mut stream, b"").unwrap();
+
+        let mut reader = Cursor::new(stream);
+        let first = stdio::read_frame(&mut reader).unwrap().unwrap();
+        assert_eq!(first, payload);
+        assert_eq!(stdio::read_frame(&mut reader).unwrap().unwrap(), b"");
+        assert!(stdio::read_frame(&mut reader).unwrap().is_none());
+        assert!(
+            matches!(
+                bincode::deserialize::<WorkerEvent>(&first).unwrap(),
+                WorkerEvent::Response(Response { id: 9, .. })
+            ),
+            "desktop frames use the browser worker's event encoding"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stdio_rejects_oversized_headers_and_payloads() {
+        use std::io::Cursor;
+
+        let mut header = Cursor::new(((stdio::MAX_FRAME_BYTES as u32) + 1).to_le_bytes().to_vec());
+        let error = stdio::read_frame(&mut header).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+
+        let mut stream = Vec::new();
+        let length = ((stdio::MAX_FRAME_BYTES as u32) + 1).to_le_bytes();
+        stream.extend_from_slice(&length);
+        let mut reader = Cursor::new(stream);
+        assert!(stdio::read_frame(&mut reader).is_err());
     }
 }

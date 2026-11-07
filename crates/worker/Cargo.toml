@@ -9,6 +9,8 @@ numbering-core.workspace = true
 numbering-pdf.workspace = true
 serde.workspace = true
 bincode.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen.workspace = true
 js-sys.workspace = true
 web-sys = { workspace = true, features = ["DedicatedWorkerGlobalScope", "MessageEvent", "console"] }

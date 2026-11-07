@@ -11,7 +11,7 @@ use numbering_core::{
     Alignment, Arrangement, Artwork, ArtworkKind, CustomFont, Order, PT_PER_MM, Project, Rotation,
 };
 use numbering_worker::{Operation, Output, Request, Response};
-use std::{collections::BTreeSet, rc::Rc};
+use std::{collections::BTreeSet, rc::Rc, time::Duration};
 use worker_client::WorkerClient;
 
 #[derive(Clone)]
@@ -50,23 +50,97 @@ struct Background {
     pages: usize,
 }
 
+/// A document replacement that waits until unsaved edits are resolved.
+#[derive(Clone)]
+enum PendingReplace {
+    New,
+    Open(String),
+    Load {
+        project: Box<Project>,
+        id: Option<String>,
+        notice: String,
+    },
+}
+
+/// The signals that describe the open document, grouped so helpers can take one
+/// argument instead of a dozen.
+#[derive(Clone, Copy)]
+struct DocumentCtx {
+    editor: Signal<Editor>,
+    current_id: Signal<Option<String>>,
+    library: Signal<Vec<storage::ProjectSummary>>,
+    library_open: Signal<bool>,
+    background: Signal<Background>,
+    proof: Signal<Option<(u64, usize, String)>>,
+    sheet: Signal<usize>,
+    export_start: Signal<usize>,
+    export_end: Signal<usize>,
+    bridge: Bridge,
+    pending: Signal<Option<Job>>,
+    serial: Signal<u64>,
+    message: Signal<String>,
+    save_status: Signal<String>,
+    saved_revision: Signal<Option<u64>>,
+    save_lock: Signal<Rc<futures_util::lock::Mutex<()>>>,
+}
+
 type Bridge = Signal<Option<Rc<WorkerClient>>>;
 
 fn main() {
-    // The same bundle also runs as the PDF worker: a Web Worker has no `window`.
+    // Web build: the same bundle also runs as the PDF worker (a Web Worker has no `window`).
+    #[cfg(target_arch = "wasm32")]
     if web_sys::window().is_none() {
         numbering_worker::run_worker();
         return;
     }
+
+    // Desktop build: the app starts this same executable as a child PDF worker.
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::env::args().any(|argument| argument == "--pdf-worker") {
+        if let Err(error) = numbering_worker::stdio::run_worker_stdio() {
+            eprintln!("PDF worker failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "wasm32")]
     console_error_panic_hook::set_once();
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
+        let window = WindowBuilder::new()
+            .with_title("Folio — precise numbering")
+            .with_inner_size(LogicalSize::new(1440.0, 900.0))
+            .with_min_inner_size(LogicalSize::new(960.0, 640.0));
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        let window = window.with_window_icon(Some(desktop_icon()));
+
+        dioxus::LaunchBuilder::desktop()
+            .with_cfg(Config::new().with_window(window))
+            .launch(App);
+    }
+
+    #[cfg(target_arch = "wasm32")]
     dioxus::launch(App);
 }
 
 /// A smooth continuous-corner ("squircle") outline in a 100 × 100 box.
 const SQUIRCLE: &str = "M50 0C85 0 100 15 100 50S85 100 50 100 0 85 0 50 15 0 50 0Z";
 
-/// The same icon as the header mark, for the browser tab.
-const FAVICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cpath d='M50 0C85 0 100 15 100 50S85 100 50 100 0 85 0 50 15 0 50 0Z' fill='%23175c4c'/%3E%3Ctext x='49' y='62' text-anchor='middle' font-family='Georgia,serif' font-style='italic' font-size='62' fill='white'%3Ef%3C/text%3E%3C/svg%3E";
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn desktop_icon() -> dioxus::desktop::tao::window::Icon {
+    let icon = image::load_from_memory_with_format(
+        include_bytes!("../icons/32x32.png"),
+        image::ImageFormat::Png,
+    )
+    .expect("Folio's embedded window icon must be a valid PNG")
+    .into_rgba8();
+    let (width, height) = icon.dimensions();
+    dioxus::desktop::tao::window::Icon::from_rgba(icon.into_raw(), width, height)
+        .expect("Folio's window icon must have valid RGBA dimensions")
+}
 
 fn send_job(
     bridge: Bridge,
@@ -103,7 +177,7 @@ fn send_request(
             project,
             operation,
         }) {
-            web_sys::console::error_1(&error.into());
+            browser::log_error(&error);
             pending.set(None);
         }
     } else {
@@ -119,12 +193,254 @@ fn clamp_fields(project: &mut Project) {
     }
 }
 
+/// Replaces the current document and resets every view that refers to the old one.
+/// `id` is the library entry the document came from, if it has one.
+fn adopt_project(project: Project, id: Option<String>, mut doc: DocumentCtx) {
+    let has_artwork = project.artwork.is_some();
+    let sheet_count = project.sheet_count();
+    doc.editor.write().replace(project);
+    doc.current_id.set(id);
+    doc.background.set(Background::default());
+    doc.proof.set(None);
+    doc.sheet.set(0);
+    doc.export_start.set(1);
+    doc.export_end.set(sheet_count.min(500));
+    if has_artwork {
+        send_job(
+            doc.bridge,
+            doc.pending,
+            doc.serial,
+            doc.editor,
+            Operation::Inspect {
+                adopt_page_size: false,
+            },
+        );
+    }
+}
+
+async fn restore_project() -> Result<Option<(Project, Option<String>)>, String> {
+    let id = storage::load_current_id().await?;
+    let (bytes, id) = match id.as_deref().and_then(|id| id.strip_prefix("library:")) {
+        Some(id) => (storage::load_project(id).await?, Some(id.to_string())),
+        // Migrate the old recovery snapshot, including edits that had never
+        // been written to its associated library entry.
+        None => (storage::load().await?, id),
+    };
+    bytes
+        .map(|bytes| {
+            Project::from_bytes(&bytes)
+                .map(|project| (project, id))
+                .map_err(|error| error.to_string())
+        })
+        .transpose()
+}
+
+async fn autosave(mut doc: DocumentCtx) -> Result<(), String> {
+    let (revision, bytes, name) = {
+        let editor = doc.editor.peek();
+        if *doc.saved_revision.peek() == Some(editor.revision) {
+            return Ok(());
+        }
+        (
+            editor.revision,
+            editor
+                .project
+                .to_bytes()
+                .map_err(|error| error.to_string())?,
+            editor.project.name.clone(),
+        )
+    };
+    let existing_id = doc.current_id.peek().clone();
+    let id = existing_id.unwrap_or_else(|| {
+        let id = storage::new_project_id();
+        doc.current_id.set(Some(id.clone()));
+        id
+    });
+    let summary = storage::save_project(&id, &name, &bytes).await?;
+    {
+        let mut entries = doc.library.write();
+        entries.retain(|entry| entry.id != id);
+        entries.insert(0, summary);
+    }
+    storage::save_current_id(Some(&format!("library:{id}"))).await?;
+    doc.saved_revision.set(Some(revision));
+    if doc.editor.peek().revision == revision {
+        doc.save_status.set("Autosaved to library".into());
+    }
+    Ok(())
+}
+
+fn blank_project(library: &[storage::ProjectSummary]) -> Project {
+    const NAME_PREFIX: &str = "Untitled numbering ";
+    let next_number = library
+        .iter()
+        .filter_map(|entry| entry.name.strip_prefix(NAME_PREFIX)?.parse::<u64>().ok())
+        .max()
+        .map_or(1, |number| number.checked_add(1).unwrap_or(1));
+    let number = (next_number..)
+        .find(|number| {
+            let name = format!("{NAME_PREFIX}{number}");
+            !library.iter().any(|entry| entry.name == name)
+        })
+        .expect("a finite library cannot use every project number");
+    Project {
+        name: format!("{NAME_PREFIX}{number}"),
+        arrangement: Arrangement::Free,
+        ..Project::default()
+    }
+}
+
+fn apply_replace(action: PendingReplace, mut doc: DocumentCtx) {
+    doc.library_open.set(false);
+    match action {
+        PendingReplace::New => {
+            adopt_project(blank_project(&doc.library.peek()), None, doc);
+            doc.message.set("New project created.".into());
+        }
+        PendingReplace::Open(_) => unreachable!("Library entry must be loaded before replacement"),
+        PendingReplace::Load {
+            project,
+            id,
+            notice,
+        } => {
+            adopt_project(*project, id, doc);
+            doc.message.set(notice);
+        }
+    }
+}
+
+fn request_replace(
+    action: PendingReplace,
+    doc: DocumentCtx,
+    mut pending_replace: Signal<Option<PendingReplace>>,
+) {
+    spawn(async move {
+        let mut doc = doc;
+        let lock = doc.save_lock.peek().clone();
+        let _guard = lock.lock().await;
+        let action = match action {
+            PendingReplace::Open(id) => {
+                if doc.current_id.peek().as_deref() == Some(id.as_str()) {
+                    doc.library_open.set(false);
+                    return;
+                }
+                let project = match storage::load_project(&id).await {
+                    Ok(Some(bytes)) => {
+                        Project::from_bytes(&bytes).map_err(|error| error.to_string())
+                    }
+                    Ok(None) => Err("That project is no longer in the library.".into()),
+                    Err(error) => Err(error),
+                };
+                match project {
+                    Ok(project) => PendingReplace::Load {
+                        project: Box::new(project),
+                        id: Some(id),
+                        notice: "Project opened from your library.".into(),
+                    },
+                    Err(error) => {
+                        doc.message.set(error);
+                        return;
+                    }
+                }
+            }
+            action => action,
+        };
+        while *doc.saved_revision.peek() != Some(doc.editor.peek().revision) {
+            if let Err(error) = autosave(doc).await {
+                doc.save_status.set(format!("Autosave failed: {error}"));
+                pending_replace.set(Some(action));
+                return;
+            }
+        }
+        apply_replace(action, doc);
+        if let Err(error) = autosave(doc).await {
+            doc.save_status.set(format!("Autosave failed: {error}"));
+        }
+    });
+}
+
+fn refresh_library(mut doc: DocumentCtx) {
+    spawn(async move {
+        let lock = doc.save_lock.peek().clone();
+        let _guard = lock.lock().await;
+        match storage::list_projects().await {
+            Ok(entries) => doc.library.set(entries),
+            Err(error) => doc.message.set(error),
+        }
+    });
+}
+
+fn export_filename(name: &str) -> String {
+    let mut stem = String::new();
+    let mut last_dash = false;
+    for character in name.trim().chars() {
+        if stem.len() >= 80 {
+            break;
+        }
+        if character.is_alphanumeric() {
+            stem.push(character);
+            last_dash = false;
+        } else if !last_dash {
+            stem.push('-');
+            last_dash = true;
+        }
+    }
+    let stem = stem.trim_matches('-');
+    let stem = if stem.is_empty() { "project" } else { stem };
+    format!("{stem}.folio.json")
+}
+
+fn export_project(bytes: Vec<u8>, name: &str, mut message: Signal<String>) {
+    let filename = export_filename(name);
+    spawn(async move {
+        match browser::download(&bytes, &filename, "application/json").await {
+            Ok(true) => message.set(
+                "Exported a project file. Keep it as a backup or open it on another device.".into(),
+            ),
+            Ok(false) => message.set("Export canceled.".into()),
+            Err(error) => message.set(error),
+        }
+    });
+}
+
+fn relative_time(updated_at: u64) -> String {
+    let seconds = storage::now_millis().saturating_sub(updated_at) / 1000;
+    match seconds {
+        0..=59 => "just now".into(),
+        60..=3_599 => format!("{} min ago", seconds / 60),
+        3_600..=86_399 => format!("{} h ago", seconds / 3_600),
+        _ => format!("{} d ago", seconds / 86_400),
+    }
+}
+
+const NEW_ICON: &str = "M12 5v14M5 12h14";
+const IMPORT_ICON: &str = "M12 16V4m-4 4 4-4 4 4M5 15v5h14v-5";
+const EXPORT_ICON: &str = "M12 4v12m-4-4 4 4 4-4M5 16v4h14v-4";
+const DELETE_ICON: &str = "M4 7h16m-14 0 1 13h10l1-13M9 7V4h6v3m-5 3v7m4-7v7";
+
+fn action_icon(path_data: &str) -> Element {
+    rsx! {
+        svg { view_box: "0 0 24 24", width: "20", height: "20", fill: "none",
+            stroke: "currentColor", stroke_width: "1.7", stroke_linecap: "round",
+            stroke_linejoin: "round", "aria-hidden": "true",
+            path { d: path_data }
+        }
+    }
+}
+
 #[component]
 fn App() -> Element {
     let mut editor = use_signal(Editor::default);
     let mut message = use_signal(|| String::from("Your files stay on this device."));
     let mut save_status = use_signal(|| String::from("Opening local storage…"));
     let mut restored = use_signal(|| false);
+    let mut library_open = use_signal(|| true);
+    let mut library = use_signal(Vec::<storage::ProjectSummary>::new);
+    let current_id = use_signal(|| None::<String>);
+    let save_lock = use_signal(|| Rc::new(futures_util::lock::Mutex::new(())));
+    let saved_revision = use_signal(|| None::<u64>);
+    let mut deleting_project = use_signal(|| None::<storage::ProjectSummary>);
+    let mut pending_replace = use_signal(|| None::<PendingReplace>);
     let mut background = use_signal(Background::default);
     let mut proof = use_signal(|| None::<(u64, usize, String)>);
     let mut pending = use_signal(|| None::<Job>);
@@ -161,6 +477,25 @@ fn App() -> Element {
     let props_open = use_signal(|| true);
     let export_open = use_signal(|| true);
 
+    let doc = DocumentCtx {
+        editor,
+        current_id,
+        library,
+        library_open,
+        background,
+        proof,
+        sheet,
+        export_start,
+        export_end,
+        bridge,
+        pending,
+        serial,
+        message,
+        save_status,
+        saved_revision,
+        save_lock,
+    };
+
     use_effect(move || {
         let _generation = worker_generation();
         let worker = WorkerClient::new(
@@ -187,22 +522,19 @@ fn App() -> Element {
                 let Some(job) = pending.peek().clone() else {
                     return;
                 };
-                web_sys::console::log_1(
-                    &format!(
-                        "[dbg] response id={} job.id={} job.rev={} editor.rev={} op={}",
-                        response.id,
-                        job.id,
-                        job.revision,
-                        editor.peek().revision,
-                        match &job.operation {
-                            Operation::Inspect { adopt_page_size } =>
-                                format!("inspect adopt={adopt_page_size}"),
-                            Operation::Background => "background".to_string(),
-                            _ => "other".to_string(),
-                        }
-                    )
-                    .into(),
-                );
+                browser::log_debug(&format!(
+                    "[dbg] response id={} job.id={} job.rev={} editor.rev={} op={}",
+                    response.id,
+                    job.id,
+                    job.revision,
+                    editor.peek().revision,
+                    match &job.operation {
+                        Operation::Inspect { adopt_page_size } =>
+                            format!("inspect adopt={adopt_page_size}"),
+                        Operation::Background => "background".to_string(),
+                        _ => "other".to_string(),
+                    }
+                ));
                 if response.id != job.id {
                     return;
                 }
@@ -234,7 +566,7 @@ fn App() -> Element {
                             let label = info.family.unwrap_or_else(|| font.name.clone());
                             // The worker has accepted the file; now let the browser parse it
                             // for the live preview before the project adopts it.
-                            wasm_bindgen_futures::spawn_local(async move {
+                            spawn(async move {
                                 match browser::ensure_font(&font.family, &font.bytes).await {
                                     Ok(()) => {
                                         editor.write().set_font(Some(font));
@@ -304,10 +636,14 @@ fn App() -> Element {
                             } => (start_sheet + 1, end_sheet),
                             _ => (1, 1),
                         };
-                        match browser::download(&bytes, &format!("folio-sheets-{start}-{end}.pdf"), "application/pdf") {
-                        Ok(()) => message.set(format!("Exported sheets {start}–{end}. Print at actual size (100%), without fit-to-page.")),
-                        Err(error) => message.set(error),
-                    }
+                        let filename = format!("folio-sheets-{start}-{end}.pdf");
+                        spawn(async move {
+                            match browser::download(&bytes, &filename, "application/pdf").await {
+                                Ok(true) => message.set(format!("Exported sheets {start}–{end}. Print at actual size (100%), without fit-to-page.")),
+                                Ok(false) => message.set("Export canceled.".into()),
+                                Err(error) => message.set(error),
+                            }
+                        });
                     }
                     Ok(Output::Progress { .. }) => unreachable!(),
                 }
@@ -328,36 +664,35 @@ fn App() -> Element {
     use_future(move || async move {
         // The bundled typeface is part of the binary, so no font file is served.
         if let Err(error) = browser::ensure_font("Noto Sans", numbering_worker::FONT_BYTES).await {
-            web_sys::console::warn_1(&error.into());
+            browser::log_warn(&error);
+        }
+    });
+
+    // A desktop WebView cannot be measured synchronously from Rust. Keep a cache of the
+    // canvas and number rectangles warm so pointer handlers can work without awaiting.
+    #[cfg(not(target_arch = "wasm32"))]
+    use_future(move || async move {
+        loop {
+            browser::refresh_metrics().await;
+            futures_timer::Delay::new(browser::METRICS_INTERVAL).await;
         }
     });
 
     use_future(move || async move {
-        match storage::load().await {
-            Ok(Some(bytes)) => match Project::from_bytes(&bytes) {
-                Ok(project) => {
-                    let has_artwork = project.artwork.is_some();
-                    editor.write().replace(project);
-                    export_end.set(editor.read().project.sheet_count().min(500));
-                    if has_artwork {
-                        send_job(
-                            bridge,
-                            pending,
-                            serial,
-                            editor,
-                            Operation::Inspect {
-                                adopt_page_size: false,
-                            },
-                        );
-                    }
-                    message.set("Restored your last local project.".into());
-                }
-                Err(error) => message.set(format!(
-                    "Could not restore autosave: {error}. You can open a downloaded backup."
-                )),
-            },
-            Ok(None) => {}
+        match storage::list_projects().await {
+            Ok(entries) => library.set(entries),
             Err(error) => message.set(error),
+        }
+        match restore_project().await {
+            Ok(Some((project, id))) => {
+                adopt_project(project, id, doc);
+                message.set("Restored your last local project.".into());
+            }
+            Ok(None) => adopt_project(blank_project(&library.peek()), None, doc),
+            Err(error) => {
+                adopt_project(blank_project(&library.peek()), None, doc);
+                message.set(format!("Could not restore your project: {error}"));
+            }
         }
         restored.set(true);
     });
@@ -367,23 +702,21 @@ fn App() -> Element {
         if !restored() {
             return;
         }
-        save_status.set("Unsaved changes…".into());
+        if *saved_revision.peek() == Some(revision) {
+            return;
+        }
+        save_status.set("Saving…".into());
+        let is_new = current_id.peek().is_none();
         spawn(async move {
-            gloo_timers::future::TimeoutFuture::new(900).await;
-            if editor.peek().revision != revision {
-                return;
+            if !is_new {
+                futures_timer::Delay::new(Duration::from_millis(900)).await;
             }
-            let bytes = editor.peek().project.to_bytes();
-            match bytes {
-                Ok(bytes) => match storage::save(&bytes).await {
-                    Ok(()) => {
-                        if editor.peek().revision == revision {
-                            save_status.set("Saved on this device".into());
-                        }
-                    }
-                    Err(error) => save_status.set(error),
-                },
-                Err(_) => save_status.set("Fix validation errors to autosave".into()),
+            let lock = save_lock.peek().clone();
+            let _guard = lock.lock().await;
+            if editor.peek().revision == revision
+                && let Err(error) = autosave(doc).await
+            {
+                save_status.set(format!("Autosave failed: {error}"));
             }
         });
     });
@@ -428,7 +761,7 @@ fn App() -> Element {
     use_effect(move || {
         if let Some(job) = pending() {
             spawn(async move {
-                gloo_timers::future::TimeoutFuture::new(60_000).await;
+                futures_timer::Delay::new(Duration::from_millis(60_000)).await;
                 if pending.peek().as_ref().is_some_and(|p| p.id == job.id) {
                     pending.set(None);
                     bridge.set(None);
@@ -623,7 +956,28 @@ fn App() -> Element {
     };
     let pane_artwork = rsx! {
                     SidebarSection { title: "Artwork & paper", number: "03", open: artwork_open,
-                        button { class: "upload-button", disabled: busy || !restored() || !worker_available, onclick: move |_| browser::open_picker("artwork-file"),
+                        button { class: "upload-button", disabled: busy || !restored() || !worker_available, onclick: move |_| {
+                            // Open the picker inside the click handler so it still counts as a user gesture.
+                            let picking = browser::pick_file(browser::FileKind::Artwork);
+                            spawn(async move {
+                                let Some(file) = (match picking.await {
+                                    Ok(file) => file,
+                                    Err(error) => { message.set(error); return; }
+                                }) else { return; };
+                                let name = file.name;
+                                let bytes = file.bytes;
+                                let kind = if bytes.starts_with(b"%PDF-") { ArtworkKind::Pdf }
+                                    else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { ArtworkKind::Png }
+                                    else if bytes.starts_with(b"\xff\xd8\xff") { ArtworkKind::Jpeg }
+                                    else { message.set("Choose a PDF, PNG, or JPEG file.".into()); return; };
+                                let mut p = editor.read().project.clone();
+                                p.artwork = Some(Artwork { name, kind, bytes, page_index: 0, scale_percent: 100.0, offset_x_mm: 0.0, offset_y_mm: 0.0 });
+                                editor.write().replace(p); background.set(Background::default()); proof.set(None);
+                                just_imported.set(true);
+                                send_job(bridge, pending, serial, editor, Operation::Inspect { adopt_page_size: true });
+                                message.set("Opening artwork in the Rust PDF worker…".into());
+                            });
+                        },
                             span { class: "upload-icon", "+" } strong { if p.artwork.is_some() { "Replace artwork" } else { "Import artwork" } }
                             span { "PDF, PNG or JPEG · up to 20 MB" }
                         }
@@ -707,7 +1061,22 @@ fn App() -> Element {
                             div { class: "font-name", title: "{font_label}", "{font_label}" }
                             div { class: "two-columns",
                                 button { class: "button outline", disabled: busy || !restored() || !worker_available,
-                                    onclick: move |_| browser::open_picker("font-file"), "Import font…" }
+                                    onclick: move |_| {
+                                        // Open the picker inside the click handler so it still counts as a user gesture.
+                                        let picking = browser::pick_file(browser::FileKind::Font);
+                                        spawn(async move {
+                                            let Some(file) = (match picking.await {
+                                                Ok(file) => file,
+                                                Err(error) => { message.set(error); return; }
+                                            }) else { return; };
+                                            let font = CustomFont::new(file.name, file.bytes);
+                                            message.set("Checking the font…".into());
+                                            let candidate = Project { font: Some(font.clone()), ..Default::default() };
+                                            candidate_font.set(Some(font));
+                                            let revision = editor.peek().revision;
+                                            send_request(bridge, pending, serial, revision, candidate, Operation::InspectFont);
+                                        });
+                                    }, "Import font…" }
                                 button { class: "button quiet", disabled: p.font.is_none(),
                                     onclick: move |_| { editor.write().set_font(None); message.set("Using the bundled Noto Sans font.".into()); }, "Use default" }
                             }
@@ -766,10 +1135,24 @@ fn App() -> Element {
         document::Title { "Folio — precise numbering" }
         document::Meta { name: "description", content: "Private, local-first ticket and form numbering. Built in Rust." }
         document::Meta { name: "theme-color", content: "#153f39" }
-        document::Link { rel: "icon", r#type: "image/svg+xml", href: FAVICON }
+        document::Link { rel: "icon", r#type: "image/svg+xml", href: asset!("/assets/folio.svg") }
         document::Stylesheet { href: asset!("/assets/styles.css") }
         div { class: "app-shell",
+            if !library_open() {
             header { class: "app-header",
+                button { class: "header-icon-button", aria_label: "Project library", title: "Project library", disabled: !restored(),
+                    onclick: move |_| {
+                        library_open.set(true);
+                        deleting_project.set(None);
+                        refresh_library(doc);
+                    },
+                    svg { view_box: "0 0 24 24", width: "20", height: "20", fill: "none", stroke: "currentColor", stroke_width: "1.7", stroke_linecap: "round", stroke_linejoin: "round", "aria-hidden": "true",
+                        path { d: "M4 4.5h3.8v15H4z" }
+                        path { d: "M9.2 4.5h3.8v15H9.2z" }
+                        path { d: "M14.6 5.4l3.2-.9 3 14.6-3.2.9z" }
+                        path { d: "M3.5 21h17" }
+                    }
+                }
                 div { class: "brand",
                     svg { class: "brand-mark", view_box: "0 0 100 100", role: "img", "aria-label": "Folio",
                         path { d: SQUIRCLE, fill: "#175c4c" }
@@ -787,13 +1170,20 @@ fn App() -> Element {
                     button { class: "button outline", aria_expanded: mobile_panel() == Some("fields"), onclick: move |_| mobile_panel.set(if mobile_panel() == Some("fields") { None } else { Some("fields") }), "Fields" }
                 }
                 div { class: "header-actions",
-                    button { class: "button quiet", aria_label: "Open project", disabled: !restored() || busy,
-                        onclick: move |_| browser::open_picker("project-file"), "Open" span { class: "action-detail", " project" } }
-                    button { class: "button outline", aria_label: "Save project", disabled: !restored() || validation.is_some(), onclick: move |_| {
-                        let result = editor.read().project.to_bytes().map_err(|e| e.to_string())
-                            .and_then(|bytes| browser::download(&bytes, "project.folio.json", "application/json"));
-                        message.set(result.err().unwrap_or_else(|| "Project backup downloaded, including its original artwork.".into()));
-                    }, "Save" span { class: "action-detail", " project" } }
+                    button { class: "button quiet", aria_label: "Export project to a file", disabled: !restored() || validation.is_some(),
+                        onclick: move |_| {
+                            let (bytes, name) = {
+                                let editor = editor.read();
+                                match editor.project.to_bytes() {
+                                    Ok(bytes) => (bytes, editor.project.name.clone()),
+                                    Err(error) => { message.set(error.to_string()); return; }
+                                }
+                            };
+                            export_project(bytes, &name, message);
+                        }, "Export" span { class: "action-detail", " file" } }
+                    button { class: "button outline", aria_label: "New project", disabled: !restored(),
+                        onclick: move |_| request_replace(PendingReplace::New, doc, pending_replace),
+                        "New" span { class: "action-detail", " project" } }
                 }
             }
             main { class: "workspace", aria_busy: !restored(),
@@ -829,7 +1219,7 @@ fn App() -> Element {
                                 view_box: "0 0 {page_width} {page_height}", width: "100%", style: "aspect-ratio: {page_width} / {page_height}; touch-action: none;",
                                 onpointerdown: move |event| {
                                     if proof_showing || event.trigger_button() != Some(dioxus::html::input_data::MouseButton::Primary) { return; }
-                                    let Some(rect) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("page-editor")).map(|e| e.get_bounding_client_rect()) else { return; };
+                                    let Some(rect) = browser::editor_rect() else { return; };
                                     let pos = event.client_coordinates();
                                     if art_move() {
                                         let origin = editor.read().project.artwork.as_ref().map(|a| (a.offset_x_mm, a.offset_y_mm));
@@ -850,43 +1240,43 @@ fn App() -> Element {
                                             BTreeSet::new()
                                         }
                                     };
-                                    let at = ((pos.x - rect.x()) * page_width / rect.width(), (pos.y - rect.y()) * page_height / rect.height());
+                                    let at = ((pos.x - rect.x) * page_width / rect.width, (pos.y - rect.y) * page_height / rect.height);
                                     marquee.set(Some(Marquee { start_client: (pos.x, pos.y), start_mm: at, current_mm: at, base, additive }));
                                 },
                                 onpointermove: move |event| {
                                     if let Some((cx, cy, ox, oy)) = art_drag() {
-                                        let Some(rect) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("page-editor")).map(|e| e.get_bounding_client_rect()) else { return; };
+                                        let Some(rect) = browser::editor_rect() else { return; };
                                         let pos = event.client_coordinates();
-                                        let mut x = ox + (pos.x - cx) * page_width / rect.width();
-                                        let mut y = oy + (pos.y - cy) * page_height / rect.height();
+                                        let mut x = ox + (pos.x - cx) * page_width / rect.width;
+                                        let mut y = oy + (pos.y - cy) * page_height / rect.height;
                                         if snap() {
                                             // Pull onto the centred position when close, per axis (about 8 screen px).
-                                            if x.abs() * rect.width() / page_width < 8.0 { x = 0.0; }
-                                            if y.abs() * rect.height() / page_height < 8.0 { y = 0.0; }
+                                            if x.abs() * rect.width / page_width < 8.0 { x = 0.0; }
+                                            if y.abs() * rect.height / page_height < 8.0 { y = 0.0; }
                                         }
                                         editor.write().set_artwork_offset(x, y);
                                         return;
                                     }
                                     if let Some(active) = marquee() {
-                                        let Some(rect) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("page-editor")).map(|e| e.get_bounding_client_rect()) else { return; };
+                                        let Some(rect) = browser::editor_rect() else { return; };
                                         let pos = event.client_coordinates();
                                         let mut ids: Vec<u32> = if active.additive { active.base.iter().copied().collect() } else { Vec::new() };
                                         ids.extend(browser::fields_in_client_rect(active.start_client.0, active.start_client.1, pos.x, pos.y));
                                         editor.write().set_selection(ids);
                                         marquee.set(Some(Marquee {
-                                            current_mm: ((pos.x - rect.x()) * page_width / rect.width(), (pos.y - rect.y()) * page_height / rect.height()),
+                                            current_mm: ((pos.x - rect.x) * page_width / rect.width, (pos.y - rect.y) * page_height / rect.height),
                                             ..active
                                         }));
                                         return;
                                     }
                                     if let Some(start) = drag() {
-                                        let Some(rect) = web_sys::window().and_then(|w| w.document()).and_then(|d| d.get_element_by_id("page-editor")).map(|e| e.get_bounding_client_rect()) else { return; };
+                                        let Some(rect) = browser::editor_rect() else { return; };
                                         let pos = event.client_coordinates();
-                                        let x = start.origin_x + (pos.x - start.client_x) * page_width / rect.width();
-                                        let y = start.origin_y + (pos.y - start.client_y) * page_height / rect.height();
+                                        let x = start.origin_x + (pos.x - start.client_x) * page_width / rect.width;
+                                        let y = start.origin_y + (pos.y - start.client_y) * page_height / rect.height;
                                         let mut e = editor.write();
                                         let tolerance = (e.project.arrangement == Arrangement::Free && show_guides() && snap_guides())
-                                            .then_some((6.0 * page_width / rect.width(), 6.0 * page_height / rect.height()));
+                                            .then_some((6.0 * page_width / rect.width, 6.0 * page_height / rect.height));
                                         let targets: Vec<_> = e.project.fields.iter().filter(|f| !start.origins.iter().any(|(id,_,_)| *id == f.id)).cloned().collect();
                                         let (x,y) = guides::snap_position(&targets, start.id, (x,y), tolerance, snap());
                                         e.translate_from(&start.origins, x - start.origin_x, y - start.origin_y);
@@ -1013,7 +1403,111 @@ fn App() -> Element {
                 }
             }
             if let Some(error) = &validation { div { class: "validation", role: "alert", "{error}" } }
+            }
+            if library_open() {
+                main { class: "library-view", aria_labelledby: "library-title", aria_busy: !restored(),
+                    inert: (deleting_project().is_some() || pending_replace().is_some()).then_some(""),
+                    div { class: "library-content",
+                        header { class: "library-header",
+                            div {
+                                h1 { id: "library-title", "Project library" }
+                                p { "Saved inside Folio on this device." }
+                            }
+                            button { class: "button outline", disabled: !restored(), onclick: move |_| library_open.set(false), "Back to editor" }
+                        }
+                        div { class: "library-actions",
+                            button { class: "header-icon-button", title: "New project", aria_label: "New project", disabled: !restored(),
+                                onclick: move |_| request_replace(PendingReplace::New, doc, pending_replace),
+                                {action_icon(NEW_ICON)} }
+                            button { class: "header-icon-button", title: "Export current project", aria_label: "Export current project", disabled: !restored() || validation.is_some(),
+                                onclick: move |_| {
+                                    let (bytes, name) = {
+                                        let editor = editor.read();
+                                        match editor.project.to_bytes() {
+                                            Ok(bytes) => (bytes, editor.project.name.clone()),
+                                            Err(error) => { message.set(error.to_string()); return; }
+                                        }
+                                    };
+                                    export_project(bytes, &name, message);
+                                }, {action_icon(EXPORT_ICON)} }
+                            button { class: "header-icon-button", title: "Import project", aria_label: "Import project", disabled: !restored(),
+                                onclick: move |_| {
+                                    // Open the picker inside the click handler so it still counts as a user gesture.
+                                    let picking = browser::pick_file(browser::FileKind::Project);
+                                    spawn(async move {
+                                        let Some(file) = (match picking.await {
+                                            Ok(file) => file,
+                                            Err(error) => { message.set(error); return; }
+                                        }) else { return; };
+                                        match Project::from_bytes(&file.bytes) {
+                                            Ok(project) => request_replace(
+                                                PendingReplace::Load {
+                                                    project: Box::new(project),
+                                                    id: None,
+                                                    notice: "Project imported.".into(),
+                                                },
+                                                doc,
+                                                pending_replace,
+                                            ),
+                                            Err(error) => message.set(error.to_string()),
+                                        }
+                                    });
+                                }, {action_icon(IMPORT_ICON)} }
+                        }
+                        div { class: "library-list",
+                            if !restored() {
+                                p { class: "library-empty", "Loading projects…" }
+                            } else if library().is_empty() {
+                                p { class: "library-empty", "No projects yet. Create a new project or import a project file." }
+                            } else {
+                                for entry in library() {
+                                    div { class: if current_id().as_deref() == Some(entry.id.as_str()) { "library-row active" } else { "library-row" },
+                                        button { class: "library-open",
+                                            onclick: {
+                                                let id = entry.id.clone();
+                                                move |_| request_replace(
+                                                    PendingReplace::Open(id.clone()), doc, pending_replace,
+                                                )
+                                            },
+                                            strong { "{entry.name}" }
+                                            span { "Edited {relative_time(entry.updated_at)}" }
+                                        }
+                                        div { class: "library-row-actions",
+                                            if current_id().as_deref() == Some(entry.id.as_str()) {
+                                                span { class: "badge", "Current" }
+                                            }
+                                            button { class: "header-icon-button", title: "Export {entry.name}", aria_label: "Export {entry.name} to a file",
+                                                onclick: {
+                                                    let id = entry.id.clone();
+                                                    let name = entry.name.clone();
+                                                    move |_| {
+                                                        let id = id.clone();
+                                                        let name = name.clone();
+                                                        spawn(async move {
+                                                            match storage::load_project(&id).await {
+                                                                Ok(Some(bytes)) => export_project(bytes, &name, message),
+                                                                Ok(None) => message.set("That project is no longer in the library.".into()),
+                                                                Err(error) => message.set(error),
+                                                            }
+                                                        });
+                                                    }
+                                                }, {action_icon(EXPORT_ICON)} }
+                                            button { class: "header-icon-button", title: "Delete {entry.name}", aria_label: "Delete {entry.name}",
+                                                onclick: {
+                                                    let entry = entry.clone();
+                                                    move |_| deleting_project.set(Some(entry.clone()))
+                                                }, {action_icon(DELETE_ICON)} }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        p { class: "library-footer", "Projects are kept in this app's local storage. Export a .folio.json copy for a backup or to open it on another device." }
+                    }
+                }
+            }
             footer { class: "status-bar",
+                inert: deleting_project().is_some().then_some(""),
                 span { role: "status", aria_live: "polite", "{message}" }
                 if busy {
                     button { class: "button outline", onclick: move |_| {
@@ -1025,58 +1519,90 @@ fn App() -> Element {
                 }
                 span { class: "save-status", "{save_status}" }
             }
-            input { id: "artwork-file", class: "hidden", r#type: "file", accept: ".pdf,.png,.jpg,.jpeg", onchange: move |_| {
-                spawn(async move {
-                    let Some(file) = browser::selected_file("artwork-file") else { return; };
-                    match browser::read_file(&file, numbering_core::MAX_ARTWORK_BYTES).await {
-                        Ok(bytes) => {
-                            let kind = if bytes.starts_with(b"%PDF-") { ArtworkKind::Pdf }
-                                else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { ArtworkKind::Png }
-                                else if bytes.starts_with(b"\xff\xd8\xff") { ArtworkKind::Jpeg }
-                                else { message.set("Choose a PDF, PNG, or JPEG file.".into()); return; };
-                            let mut p = editor.read().project.clone();
-                            p.artwork = Some(Artwork { name: file.name(), kind, bytes, page_index: 0, scale_percent: 100.0, offset_x_mm: 0.0, offset_y_mm: 0.0 });
-                            editor.write().replace(p); background.set(Background::default()); proof.set(None);
-                            just_imported.set(true);
-                            send_job(bridge, pending, serial, editor, Operation::Inspect { adopt_page_size: true });
-                            message.set("Opening artwork in the Rust PDF worker…".into());
+            if let Some(entry) = deleting_project() {
+                div { class: "library-backdrop", onclick: move |_| deleting_project.set(None),
+                    section { class: "library-dialog", role: "alertdialog", aria_modal: "true",
+                        aria_labelledby: "delete-title", aria_describedby: "delete-description",
+                        onclick: move |event: MouseEvent| event.stop_propagation(),
+                        onkeydown: move |event: KeyboardEvent| {
+                            if event.key() == Key::Escape {
+                                deleting_project.set(None);
+                            }
+                        },
+                        header { class: "library-header",
+                            h2 { id: "delete-title", "Delete project?" }
                         }
-                        Err(error) => message.set(error),
-                    }
-                });
-            } }
-            input { id: "font-file", class: "hidden", r#type: "file", accept: ".ttf,.otf,.ttc", onchange: move |_| {
-                spawn(async move {
-                    let Some(file) = browser::selected_file("font-file") else { return; };
-                    let bytes = match browser::read_file(&file, numbering_core::MAX_FONT_BYTES).await {
-                        Ok(bytes) => bytes,
-                        Err(error) => { message.set(error); return; }
-                    };
-                    let font = CustomFont::new(file.name(), bytes);
-                    message.set("Checking the font…".into());
-                    let candidate = Project { font: Some(font.clone()), ..Default::default() };
-                    candidate_font.set(Some(font));
-                    let revision = editor.peek().revision;
-                    send_request(bridge, pending, serial, revision, candidate, Operation::InspectFont);
-                });
-            } }
-            input { id: "project-file", class: "hidden", r#type: "file", accept: ".json,.folio", onchange: move |_| {
-                spawn(async move {
-                    let Some(file) = browser::selected_file("project-file") else { return; };
-                    let result = browser::read_file(&file, numbering_core::MAX_PROJECT_BYTES).await
-                        .and_then(|bytes| Project::from_bytes(&bytes).map_err(|e| e.to_string()));
-                    match result {
-                        Ok(p) => {
-                            let has_artwork = p.artwork.is_some();
-                            editor.write().replace(p); background.set(Background::default()); proof.set(None); sheet.set(0);
-                            export_start.set(1); export_end.set(editor.read().project.sheet_count().min(500));
-                            if has_artwork { send_job(bridge, pending, serial, editor, Operation::Inspect { adopt_page_size: false }); }
-                            message.set("Project opened.".into());
+                        div { class: "unsaved-body",
+                            p { id: "delete-description", "“{entry.name}” will be permanently removed from your library." }
                         }
-                        Err(error) => message.set(error),
+                        div { class: "unsaved-actions",
+                            button { class: "button quiet", autofocus: true,
+                                onclick: move |_| deleting_project.set(None), "Cancel" }
+                            button { class: "button outline danger",
+                                onclick: move |_| {
+                                    let id = entry.id.clone();
+                                    deleting_project.set(None);
+                                    spawn(async move {
+                                        let lock = save_lock.peek().clone();
+                                        let _guard = lock.lock().await;
+                                        match storage::delete_project(&id).await {
+                                            Ok(()) => {
+                                                if current_id.peek().as_deref() == Some(id.as_str()) {
+                                                    adopt_project(blank_project(&doc.library.peek()), None, doc);
+                                                    if let Err(error) = autosave(doc).await {
+                                                        save_status.set(format!("Autosave failed: {error}"));
+                                                    }
+                                                }
+                                                library.write().retain(|project| project.id != id);
+                                                message.set("Project deleted from your library.".into());
+                                            }
+                                            Err(error) => message.set(error),
+                                        }
+                                    });
+                                }, "Delete project" }
+                        }
                     }
-                });
-            } }
+                }
+            }
+            if pending_replace().is_some() {
+                div { class: "library-backdrop", onclick: move |_| pending_replace.set(None),
+                    section { class: "library-dialog unsaved-dialog", role: "dialog", "aria-modal": "true", "aria-labelledby": "unsaved-title",
+                        onclick: move |event: MouseEvent| event.stop_propagation(),
+                        header { class: "library-header",
+                            div {
+                                h2 { id: "unsaved-title", "Autosave could not finish" }
+                                p { "This project has changes that are not saved to your library." }
+                            }
+                            button { class: "icon-button", aria_label: "Cancel", onclick: move |_| pending_replace.set(None), "×" }
+                        }
+                        div { class: "unsaved-body",
+                            p { "Retry autosave, discard the unsaved changes, or cancel." }
+                        }
+                        div { class: "unsaved-actions",
+                            button { class: "button primary", disabled: validation.is_some(),
+                                onclick: move |_| {
+                                    if let Some(action) = pending_replace.take() {
+                                        request_replace(action, doc, pending_replace);
+                                    }
+                                }, "Retry autosave" }
+                            button { class: "button quiet",
+                                onclick: move |_| {
+                                    if let Some(action) = pending_replace.take() {
+                                        spawn(async move {
+                                            let lock = save_lock.peek().clone();
+                                            let _guard = lock.lock().await;
+                                            apply_replace(action, doc);
+                                            if let Err(error) = autosave(doc).await {
+                                                save_status.set(format!("Autosave failed: {error}"));
+                                            }
+                                        });
+                                    }
+                                }, "Discard changes" }
+                            button { class: "button quiet", onclick: move |_| pending_replace.set(None), "Cancel" }
+                        }
+                    }
+                }
+            }
         }
     }
 }

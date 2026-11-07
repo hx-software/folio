@@ -3,10 +3,21 @@ name = "numbering-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors = ["HX Software"]
+description = "Private, local-first ticket and form numbering."
+repository = "https://github.com/hx-software/folio"
+
+[[bin]]
+name = "folio"
+path = "src/main.rs"
 
 [features]
-default = ["web"]
+# Platform features are selected by target: the `wasm32` target gets Dioxus Web,
+# every other target gets Dioxus Desktop. These aliases are kept so a desktop
+# dependency can still be requested explicitly by tooling.
+default = []
 web = ["dioxus/web"]
+desktop = ["dioxus/desktop"]
 
 [dependencies]
 numbering-core.workspace = true
@@ -14,13 +25,28 @@ numbering-worker.workspace = true
 dioxus = { version = "=0.7.10" }
 serde.workspace = true
 serde_json.workspace = true
+base64 = "0.22"
+bincode.workspace = true
+futures-channel = "0.3"
+futures-timer = "3"
+futures-util = "0.3"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+dioxus = { version = "=0.7.10", features = ["web"] }
 wasm-bindgen.workspace = true
 wasm-bindgen-futures = "0.4.80"
 js-sys.workspace = true
-bincode.workspace = true
-gloo-timers = { version = "0.3", features = ["futures"] }
 gloo-events = "0.2"
-base64 = "0.22"
 console_error_panic_hook = "0.1"
-futures-channel = "0.3"
-web-sys = { workspace = true, features = ["Window", "Document", "HtmlElement", "HtmlAnchorElement", "HtmlInputElement", "SvgElement", "Element", "DomRect", "Blob", "BlobPropertyBag", "Url", "File", "FileList", "Event", "IdbFactory", "IdbDatabase", "IdbOpenDbRequest", "IdbRequest", "IdbTransaction", "IdbTransactionMode", "IdbObjectStore", "DomException", "DomStringList", "EventTarget", "KeyboardEvent", "PointerEvent", "HtmlScriptElement", "Worker", "WorkerOptions", "WorkerType", "MessageEvent", "FontFace", "FontFaceSet", "Node", "NodeList"] }
+web-sys = { workspace = true, features = ["Window", "Document", "HtmlElement", "HtmlAnchorElement", "HtmlInputElement", "SvgElement", "Element", "DomRect", "Blob", "BlobPropertyBag", "Url", "File", "FileList", "Event", "IdbFactory", "IdbDatabase", "IdbOpenDbRequest", "IdbRequest", "IdbTransaction", "IdbTransactionMode", "IdbObjectStore", "DomException", "DomStringList", "EventTarget", "KeyboardEvent", "PointerEvent", "HtmlScriptElement", "Worker", "WorkerOptions", "WorkerType", "MessageEvent", "FontFace", "FontFaceSet", "Node", "NodeList", "console"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+dioxus = { version = "=0.7.10", features = ["desktop"] }
+rfd = "0.17"
+dirs = "6"
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(all(windows, target_env = "msvc"))'.build-dependencies]
+cc = "1"

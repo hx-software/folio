@@ -1,17 +1,18 @@
 # Folio — numbering studio
 
-A local-first, web-based ticket and form numbering application. Application logic,
-UI, PDF rendering, PDF export, worker transport, and storage integration are
-authored in Rust and built with the Dioxus CLI.
+A local-first ticket and form numbering application for the web and as a native
+desktop app. Application logic, UI, PDF rendering, PDF export, worker transport, and
+storage integration are authored in Rust and built with the Dioxus CLI.
 
-**Stack:** Dioxus Web 0.7 (built with `dx`), Hayro 0.9, Krilla 0.8, WebAssembly, SVG,
-IndexedDB. No server, accounts, JavaScript PDF libraries, PDFium, or native C/C++
-PDF engine.
+**Stack:** Dioxus Web / Dioxus Desktop 0.7 (built with `dx`), Hayro 0.9, Krilla 0.8,
+WebAssembly or the platform WebView, SVG, IndexedDB on the web and files on desktop.
+No server, accounts, JavaScript PDF libraries, PDFium, or native C/C++ PDF engine.
 
 > **“No JS” boundary:** there are no handwritten JavaScript application files.
-> The Dioxus CLI and wasm-bindgen generate the browser runtime. The deployed
-> application does execute that generated JavaScript; Dioxus Web cannot run with
-> JavaScript disabled. CSS is maintained normally.
+> The Dioxus CLI and wasm-bindgen generate the browser runtime, and the desktop build
+> runs the same Rust UI inside the system WebView. The running application does
+> execute WebView JavaScript; neither target works with JavaScript disabled. CSS is
+> maintained normally.
 
 ## Run
 
@@ -26,16 +27,22 @@ cargo install dioxus-cli --version 0.7.10 --locked
 From this directory:
 
 ```sh
-dx serve --web
+dx serve --web        # browser app
+dx serve --desktop    # native desktop window
 ```
 
-Open **http://127.0.0.1:8080**. Edits hot-reload. The first build needs an internet
-connection: `dx` fetches the matching `wasm-bindgen` (and, for release builds,
-`wasm-opt`). Running the application does not upload files or need any service.
+For the web target, open **http://127.0.0.1:8080**. For the desktop target, `dx`
+opens a native window using the system WebView: WebKit on macOS and Linux, WebView2
+on Windows. macOS and Windows ship everything needed; on Linux install WebKitGTK 4.1
+and GTK 3 development packages (see the Ubuntu list in `.github/workflows/ci.yml`).
 
-`dx serve` builds with the `wasm-dev` profile in the workspace `Cargo.toml`, which
-keeps the PDF engine optimised and free of debug info (a plain debug build of this
-bundle is over 180 MB).
+Edits hot-reload in both targets. The first build needs an internet connection: `dx`
+fetches the matching `wasm-bindgen` (and, for release builds, `wasm-opt`). Running
+the application does not upload files or need any service.
+
+For the web target, `dx serve` builds with the `wasm-dev` profile in the workspace
+`Cargo.toml`, which keeps the PDF engine optimised and free of debug info (a plain
+debug build of this bundle is over 180 MB).
 
 > On macOS, a prebuilt `dx` (for example from `cargo binstall`) links Homebrew's
 > OpenSSL. If it fails to start with a missing `libssl.3.dylib`, run
@@ -47,7 +54,7 @@ bundle is over 180 MB).
 dx bundle --web --release
 ```
 
-The static site is written to **`target/dx/numbering-app/release/web/public/`**:
+The static site is written to **`target/dx/folio/release/web/public/`**:
 `index.html` plus hashed files in `assets/`. Upload that directory to any static
 host and serve `.wasm` as `application/wasm`. Use HTTPS in production.
 
@@ -61,13 +68,62 @@ host and serve `.wasm` as `application/wasm`. Use HTTPS in production.
 - **Headers:** no cross-origin isolation headers are needed; the worker is
   single-threaded and uses no shared memory.
 
+### Deploy with Dokploy
+
+Create a Dokploy **Application** and connect the branch that contains the
+repository's `Dockerfile`. Select **Dockerfile** as the build type. Set
+**Dockerfile Path** to `Dockerfile`, **Docker Context Path** to `.`, and leave
+**Docker Build Stage** blank. Dokploy builds the web bundle and runs it with
+Nginx. Folio needs no environment variables, database, or volumes.
+
+Point your subdomain's DNS record at the VPS. Under **Domains**, add the
+subdomain at path `/`, set **Container Port** to `80`, and enable HTTPS with
+**Let's Encrypt**. Deploy the application, then open that HTTPS URL. Projects
+are stored in the browser for that origin. Export and import projects to move
+them from another URL.
+
+### Build and package Folio
+
+Run the command for your host from the workspace root with Dioxus CLI 0.7.10.
+The bundle metadata and installer icons live in
+[`crates/app/Dioxus.toml`](crates/app/Dioxus.toml).
+
+| Target | Command | Output |
+| --- | --- | --- |
+| macOS | `dx bundle --macos --release --locked --package-types macos --package-types dmg --out-dir dist/macos` | `Folio.app` and DMG |
+| Windows | `dx bundle --windows --release --locked --package-types nsis --out-dir dist/windows` | NSIS setup executable |
+| Linux | `dx bundle --linux --release --locked --package-types deb --package-types appimage --out-dir dist/linux` | Debian package and AppImage |
+| Web | `dx bundle --web --release --locked --out-dir dist/web` | Static site in `dist/web/public/` |
+
+The Windows build uses the MSVC Rust toolchain and Windows SDK. The installer can
+fetch WebView2 if it is missing. The Linux packages target Ubuntu 24.04-compatible
+systems and use GTK 3 and WebKitGTK 4.1. After downloading the Linux workflow
+artifact, run `chmod +x folio*.AppImage` before launching the AppImage. The app
+itself runs locally after installation.
+
+The [Release bundles workflow](.github/workflows/bundle.yml) runs on demand and
+for `v*` tags. It uploads separate artifacts for Apple silicon, Intel macOS,
+x64 Windows, x64 Linux, and web. Download the artifacts from the workflow run
+to test and stage a release. For public distribution, sign and notarize the
+macOS app and disk image with your Developer ID and sign the Windows executable
+and installer with your Authenticode credentials. The workflow produces builds
+without distribution signing credentials.
+
 ### How the PDF worker works
 
-All PDF work runs off the UI thread in a dedicated Web Worker. The worker is the
-**same bundle** as the UI: the app starts a module `Worker` from its own script
-(found via the `<script type="module">` that `dx` injects), and `main()` runs the
-worker loop when it finds no `window`. There is no second binary and no loader file
-to deploy. **Cancel operation** terminates the worker and starts a fresh one.
+All PDF work runs off the UI thread.
+
+- **Web:** a dedicated Web Worker runs the **same bundle** as the UI. The app starts
+  a module `Worker` from its own script (found via the `<script type="module">` that
+  `dx` injects), and `main()` runs the worker loop when it finds no `window`. There
+  is no second binary and no loader file to deploy.
+- **Desktop:** the app starts its own executable with the internal `--pdf-worker`
+  flag. The child process speaks length-prefixed bincode over stdin/stdout, and
+  `main()` enters the worker loop before creating a window. The work happens in a
+  separate process, so the native UI never waits on PDF work.
+
+In both targets, **Cancel operation** terminates the worker and starts a fresh one;
+on desktop the child process is killed, which also interrupts a pathological PDF.
 
 ## Workflow
 
@@ -78,6 +134,8 @@ to deploy. **Cancel operation** terminates the worker and starts a fresh one.
 5. Use **Add** to place another field, for example on a matching ticket stub.
 6. Use **PDF proof** to inspect a page generated by the actual export pipeline.
 7. Download a PDF range and print using **actual size / 100%**, not fit-to-page.
+8. Folio saves the project automatically. Use **Export** for a `.folio.json` backup
+   that can be moved to another device.
 
 ### Numbers, prefixes, and starting points
 
@@ -174,7 +232,7 @@ stack across chunks before cutting.
 - Click any sidebar section heading (or press Enter/Space on it) to collapse or
   expand it. Collapsing keeps values intact; normal edits do not reopen a section.
 
-The live SVG overlay is for editing; browser text metrics may differ slightly.
+The live SVG overlay is for editing; WebView text metrics may differ slightly.
 **PDF proof is the authoritative application preview.** Verify critical output
 with an independent PDF viewer and a physical print as well.
 
@@ -186,18 +244,38 @@ as scrollable drawers; close a drawer by clicking outside it or its button again
 
 ## Projects and privacy
 
-- Valid projects autosave to IndexedDB after a short debounce.
-- The last project is restored on reload.
-- **Save project** downloads a versioned `.folio.json` file containing the layout,
-  the original artwork, and any imported font, not references to external files.
-  Binary data is stored as base64; projects saved by earlier versions (number arrays)
-  still open, and settings added later default sensibly when missing.
-- **Open project** validates the schema and limits before replacing the current
+Folio keeps projects in a local **project library** inside the app. The library is
+shown at launch and can be reopened from the book icon at the far left of the
+editor header. Select a project to open it in the editor.
+
+- **New project** starts a blank project and saves it to the library. **Library →
+  Import file…** opens a `.folio.json` file and adds it as a new library entry.
+- Folio autosaves valid edits to the current entry after a short delay. Starting,
+  importing, or opening another project saves pending edits first. If autosave
+  fails, you can retry, discard the unsaved edits, or cancel the switch.
+- The web build uses IndexedDB. The desktop build stores the library in the
+  platform's local application data directory (for example
+  `~/Library/Application Support/Folio/library/` on macOS).
+- **Export** (header or per-project in the library) writes a versioned
+  `.folio.json` file through the browser's download flow or a native save dialog.
+  Project files contain the layout, the original artwork, and any imported font, not
+  references to external files. Binary data is stored as base64; projects saved by
+  earlier versions (number arrays) still open, and settings added later default
+  sensibly when missing.
+- **Delete** removes an entry from the library after confirmation in a dialog. Deleting
+  the open project starts a new blank project.
+- Imported files and library entries are validated before they replace the current
   document. Unsupported schema versions are rejected, not silently converted.
 
-IndexedDB is not a backup: browsers can clear it, private browsing can restrict
-it, and separate tabs currently share one autosave slot. Download project files
-for important jobs. Storage failures are displayed in the status bar.
+Folio reopens the last active project on launch or reload. Browsers can clear
+IndexedDB, private browsing can restrict it, and desktop storage can be removed
+with the application's data. Export project files for important jobs. Storage
+failures are displayed in the status bar.
+
+No file, project, font, or PDF is uploaded. The desktop build reads and writes only
+paths chosen in the native file dialogs plus its own application-data directory; the
+web build reads the files you pick and stores the library and autosave in this site's
+IndexedDB origin.
 
 ## Limits and supported scope
 
@@ -230,7 +308,8 @@ fonts are embedded and subsetted.
 
 - Duplex output, check digits, barcodes, crop marks, artwork tiling, and per-field
   typefaces.
-- Offline installation/service worker or a PWA manifest.
+- Web offline installation/service worker or a PWA manifest. (The desktop build is
+  already installable and offline.)
 - Arbitrary design editing, cloud storage, collaboration, or project migrations
   beyond the initial schema.
 - Encrypted/password-protected PDFs.
@@ -246,37 +325,47 @@ inspect the proof for clipping or overlap.
 ## Development and tests
 
 ```sh
-dx serve --web                                    # develop with hot reload
-cargo test --workspace                            # native unit and property tests
+dx serve --web                                          # web app with hot reload
+dx serve --desktop                                      # desktop app with hot reload
+cargo test --workspace                                  # native unit and property tests
+cargo clippy --workspace -- -D warnings                 # native desktop code
 cargo clippy --workspace --target wasm32-unknown-unknown -- -D warnings
 cargo fmt --all -- --check
-dx bundle --web --release                         # the deployable static site
+dx bundle --web --release                               # deployable static site
+dx bundle --desktop --release                           # installable desktop app
 ```
+
+On Linux, native builds and tests need the WebKitGTK packages listed in
+`.github/workflows/ci.yml`; macOS and Windows use their bundled system WebViews.
 
 Tests cover sequence completeness/uniqueness (including property tests), per-field
 starts, prefix/suffix spacing, cut-and-stack gaps, ticket/stub matching, overflow,
 document validation, project and binary-protocol round-trips (including legacy
-formats), history, selection, font validation and embedding, export dimensions,
-image import, PDF embedding, artwork reuse, progress, and rotated/cropped artwork.
+formats and the desktop stdio framing), history, selection, font validation and
+embedding, export dimensions, image import, PDF embedding, artwork reuse, progress,
+and rotated/cropped artwork.
 
 To write the source/embedded PNGs from the rotated-artwork regression test into
 an existing directory, set `FOLIO_TEST_ARTIFACTS` when running that test.
 
-Before a release, exercise the browser workflow in Chrome, Firefox, and Safari
-against **`dx bundle`'s output** (not only `dx serve`): drag/nudge, marquee
-selection, undo/redo, import each artwork format and a custom font, select another
-PDF page, proof/export, project backup/open, reload restore, cancel/retry, and a
-narrow viewport. Check exported numbering and physical dimensions in an independent
-PDF reader. Test real print-shop artwork and actual printers before production use.
+Before a release, exercise the workflow in Chrome, Firefox, and Safari against the
+**web bundle's output** (not only `dx serve`), and on each desktop OS against the
+packaged app. Cover drag/nudge, marquee selection, undo/redo, import each artwork
+format and a custom font, select another PDF page, proof/export, library
+autosave/open/delete, the autosave failure prompt when replacing a project, project
+import/export, reload/launch restore, cancel/retry, the native file dialogs, and a
+narrow viewport.
+Check exported numbering and physical dimensions in an independent PDF reader. Test
+real print-shop artwork and actual printers before production use.
 
 ### Workspace
 
 ```text
 crates/core/    Physical units, project schema, validation, numbering rules
 crates/pdf/     Hayro preview, Krilla export, font checks; bundled Noto Sans
-crates/worker/  Worker protocol, job dispatch, and the worker loop
-crates/app/     Dioxus UI, worker lifecycle, IndexedDB, downloads, history
-                (Dioxus.toml, assets/styles.css)
+crates/worker/  Worker protocol, job dispatch, browser worker loop, stdio worker loop
+crates/app/     Dioxus UI, platform glue, worker lifecycle, IndexedDB/desktop storage,
+                file dialogs, downloads, history (Dioxus.toml, assets/styles.css)
 ```
 
 There is no npm dependency or Node build step. `Cargo.lock` and the Rust toolchain

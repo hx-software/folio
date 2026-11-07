@@ -1,4 +1,25 @@
 [application]
+name = "Folio"
 
 [web.app]
 title = "Folio — precise numbering"
+
+[bundle]
+identifier = "com.hxsoftware.folio"
+publisher = "HX Software"
+category = "Productivity"
+icon = ["icons/Folio.icns", "icons/Folio.ico", "icons/32x32.png", "icons/256x256.png"]
+resources = ["crates/pdf/assets/FONT-LICENSE.txt"]
+short_description = "Private, local-first ticket and form numbering."
+long_description = "Folio numbers tickets and forms on your own device. Import artwork, lay out number fields, proof and export print-ready PDFs, all without uploading files."
+
+[bundle.deb]
+depends = ["libgtk-3-0", "libwebkit2gtk-4.1-0"]
+section = "graphics"
+
+[bundle.windows]
+icon_path = "icons/Folio.ico"
+webview_install_mode = { EmbedBootstrapper = { silent = true } }
+
+[bundle.windows.nsis]
+installer_icon = "icons/Folio.ico"

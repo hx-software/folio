@@ -1,0 +1,124 @@
+name: Release bundles
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    name: Desktop (${{ matrix.platform }}-${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            arch: arm64
+            runner: macos-15
+            formats: --package-types macos --package-types dmg
+            artifacts: dist/desktop/*.dmg
+          - platform: macos
+            arch: x64
+            runner: macos-15-intel
+            formats: --package-types macos --package-types dmg
+            artifacts: dist/desktop/*.dmg
+          - platform: windows
+            arch: x64
+            runner: windows-2025
+            formats: --package-types nsis
+            artifacts: dist/desktop/*-setup.exe
+          - platform: linux
+            arch: x64
+            runner: ubuntu-24.04
+            formats: --package-types deb --package-types appimage
+            artifacts: |
+              dist/desktop/*.deb
+              dist/desktop/*.AppImage
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build and packaging dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev libxdo-dev librsvg2-dev \
+            libayatana-appindicator3-dev desktop-file-utils squashfs-tools
+      - run: cargo test --workspace --locked
+      - run: cargo install dioxus-cli --version 0.7.10 --locked
+      - name: Bundle Folio
+        run: dx bundle --desktop --release --locked ${{ matrix.formats }} --out-dir dist/desktop
+      - name: Verify macOS bundle
+        if: runner.os == 'macOS'
+        run: |
+          app=dist/desktop/Folio.app
+          plist="$app/Contents/Info.plist"
+          test "$(plutil -extract CFBundleIdentifier raw "$plist")" = com.hxsoftware.folio
+          icon=$(plutil -extract CFBundleIconFile raw "$plist")
+          cmp "crates/app/icons/Folio.icns" "$app/Contents/Resources/$icon"
+          "$app/Contents/MacOS/folio" --pdf-worker < /dev/null > "$RUNNER_TEMP/folio-worker-ready"
+          test -s "$RUNNER_TEMP/folio-worker-ready"
+      - name: Verify Windows PDF worker
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $start = [System.Diagnostics.ProcessStartInfo]::new()
+          $start.FileName = (Resolve-Path target/dx/folio/release/windows/app/folio.exe).Path
+          $start.ArgumentList.Add('--pdf-worker')
+          $start.UseShellExecute = $false
+          $start.RedirectStandardInput = $true
+          $start.RedirectStandardOutput = $true
+          $worker = [System.Diagnostics.Process]::Start($start)
+          $worker.StandardInput.Close()
+          if (!$worker.WaitForExit(15000)) {
+            $worker.Kill()
+            throw 'PDF worker did not exit after stdin closed'
+          }
+          $frame = [System.IO.MemoryStream]::new()
+          $worker.StandardOutput.BaseStream.CopyTo($frame)
+          if ($worker.ExitCode -ne 0 -or [Convert]::ToHexString($frame.ToArray()) -ne '0400000000000000') {
+            throw 'PDF worker did not send the expected ready frame'
+          }
+      - name: Verify Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          test -f "$(find dist/desktop -name '*.AppImage' -print -quit)"
+          dpkg-deb --extract dist/desktop/*.deb "$RUNNER_TEMP/folio-deb"
+          cmp crates/app/icons/256x256.png "$RUNNER_TEMP/folio-deb/usr/share/icons/hicolor/256x256/apps/folio.png"
+          "$RUNNER_TEMP/folio-deb/usr/bin/folio" --pdf-worker < /dev/null > "$RUNNER_TEMP/folio-worker-ready"
+          test -s "$RUNNER_TEMP/folio-worker-ready"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: folio-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ matrix.artifacts }}
+          if-no-files-found: error
+          compression-level: 0
+
+  web:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install dioxus-cli --version 0.7.10 --locked
+      - run: dx bundle --web --release --locked --out-dir dist/web
+      - name: Verify static site
+        run: |
+          test -s dist/web/public/index.html
+          test -n "$(find dist/web/public -name 'folio*.svg' -print -quit)"
+          cp crates/pdf/assets/FONT-LICENSE.txt dist/web/public/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: folio-static-site
+          path: dist/web/public/
+          if-no-files-found: error
