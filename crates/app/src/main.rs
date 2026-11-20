@@ -1,6 +1,7 @@
 mod browser;
 mod editor;
 mod guides;
+mod i18n;
 mod storage;
 mod worker_client;
 
@@ -108,10 +109,16 @@ fn main() {
     console_error_panic_hook::set_once();
 
     #[cfg(not(target_arch = "wasm32"))]
+    let requested_languages = i18n_embed::DesktopLanguageRequester::requested_languages();
+    #[cfg(target_arch = "wasm32")]
+    let requested_languages = i18n_embed::WebLanguageRequester::requested_languages();
+    i18n::init(&requested_languages);
+
+    #[cfg(not(target_arch = "wasm32"))]
     {
         use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
         let window = WindowBuilder::new()
-            .with_title("Folio — precise numbering")
+            .with_title(fl!("folio-precise-numbering"))
             .with_inner_size(LogicalSize::new(1440.0, 900.0))
             .with_min_inner_size(LogicalSize::new(960.0, 640.0));
         #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -265,26 +272,30 @@ async fn autosave(mut doc: DocumentCtx) -> Result<(), String> {
     storage::save_current_id(Some(&format!("library:{id}"))).await?;
     doc.saved_revision.set(Some(revision));
     if doc.editor.peek().revision == revision {
-        doc.save_status.set("Autosaved to library".into());
+        doc.save_status.set(fl!("autosaved-to-library"));
     }
     Ok(())
 }
 
 fn blank_project(library: &[storage::ProjectSummary]) -> Project {
-    const NAME_PREFIX: &str = "Untitled numbering ";
+    let name_prefix = format!("{} ", fl!("untitled-numbering"));
     let next_number = library
         .iter()
-        .filter_map(|entry| entry.name.strip_prefix(NAME_PREFIX)?.parse::<u64>().ok())
+        .filter_map(|entry| {
+            ["Untitled numbering ", "Numeración sin título "]
+                .iter()
+                .find_map(|prefix| entry.name.strip_prefix(prefix)?.parse::<u64>().ok())
+        })
         .max()
         .map_or(1, |number| number.checked_add(1).unwrap_or(1));
     let number = (next_number..)
         .find(|number| {
-            let name = format!("{NAME_PREFIX}{number}");
+            let name = format!("{name_prefix}{number}");
             !library.iter().any(|entry| entry.name == name)
         })
         .expect("a finite library cannot use every project number");
     Project {
-        name: format!("{NAME_PREFIX}{number}"),
+        name: format!("{name_prefix}{number}"),
         arrangement: Arrangement::Free,
         ..Project::default()
     }
@@ -295,7 +306,7 @@ fn apply_replace(action: PendingReplace, mut doc: DocumentCtx) {
     match action {
         PendingReplace::New => {
             adopt_project(blank_project(&doc.library.peek()), None, doc);
-            doc.message.set("New project created.".into());
+            doc.message.set(fl!("new-project-created"));
         }
         PendingReplace::Open(_) => unreachable!("Library entry must be loaded before replacement"),
         PendingReplace::Load {
@@ -328,14 +339,14 @@ fn request_replace(
                     Ok(Some(bytes)) => {
                         Project::from_bytes(&bytes).map_err(|error| error.to_string())
                     }
-                    Ok(None) => Err("That project is no longer in the library.".into()),
+                    Ok(None) => Err(fl!("that-project-is-no-longer-in-the")),
                     Err(error) => Err(error),
                 };
                 match project {
                     Ok(project) => PendingReplace::Load {
                         project: Box::new(project),
                         id: Some(id),
-                        notice: "Project opened from your library.".into(),
+                        notice: fl!("project-opened-from-your-library"),
                     },
                     Err(error) => {
                         doc.message.set(error);
@@ -347,14 +358,14 @@ fn request_replace(
         };
         while *doc.saved_revision.peek() != Some(doc.editor.peek().revision) {
             if let Err(error) = autosave(doc).await {
-                doc.save_status.set(format!("Autosave failed: {error}"));
+                doc.save_status.set(fl!("autosave-failed", error = error));
                 pending_replace.set(Some(action));
                 return;
             }
         }
         apply_replace(action, doc);
         if let Err(error) = autosave(doc).await {
-            doc.save_status.set(format!("Autosave failed: {error}"));
+            doc.save_status.set(fl!("autosave-failed", error = error));
         }
     });
 }
@@ -394,10 +405,8 @@ fn export_project(bytes: Vec<u8>, name: &str, mut message: Signal<String>) {
     let filename = export_filename(name);
     spawn(async move {
         match browser::download(&bytes, &filename, "application/json").await {
-            Ok(true) => message.set(
-                "Exported a project file. Keep it as a backup or open it on another device.".into(),
-            ),
-            Ok(false) => message.set("Export canceled.".into()),
+            Ok(true) => message.set(fl!("exported-a-project-file-keep-it-as")),
+            Ok(false) => message.set(fl!("export-canceled")),
             Err(error) => message.set(error),
         }
     });
@@ -406,10 +415,10 @@ fn export_project(bytes: Vec<u8>, name: &str, mut message: Signal<String>) {
 fn relative_time(updated_at: u64) -> String {
     let seconds = storage::now_millis().saturating_sub(updated_at) / 1000;
     match seconds {
-        0..=59 => "just now".into(),
-        60..=3_599 => format!("{} min ago", seconds / 60),
-        3_600..=86_399 => format!("{} h ago", seconds / 3_600),
-        _ => format!("{} d ago", seconds / 86_400),
+        0..=59 => fl!("just-now"),
+        60..=3_599 => fl!("min-ago", count = (seconds / 60)),
+        3_600..=86_399 => fl!("h-ago", count = (seconds / 3_600)),
+        _ => fl!("d-ago", count = (seconds / 86_400)),
     }
 }
 
@@ -430,9 +439,16 @@ fn action_icon(path_data: &str) -> Element {
 
 #[component]
 fn App() -> Element {
+    use_future(move || async move {
+        use i18n_embed::LanguageLoader;
+        let language = i18n::LANGUAGE_LOADER.current_language();
+        let _ = document::eval(&format!("document.documentElement.lang = '{language}';"))
+            .join::<()>()
+            .await;
+    });
     let mut editor = use_signal(Editor::default);
-    let mut message = use_signal(|| String::from("Your files stay on this device."));
-    let mut save_status = use_signal(|| String::from("Opening local storage…"));
+    let mut message = use_signal(|| fl!("your-files-stay-on-this-device"));
+    let mut save_status = use_signal(|| fl!("opening-local-storage"));
     let mut restored = use_signal(|| false);
     let mut library_open = use_signal(|| true);
     let mut library = use_signal(Vec::<storage::ProjectSummary>::new);
@@ -539,7 +555,11 @@ fn App() -> Element {
                     return;
                 }
                 if let Ok(Output::Progress { completed, total }) = &response.result {
-                    message.set(format!("Preparing sheet {completed} of {total}…"));
+                    message.set(fl!(
+                        "preparing-sheet-of",
+                        completed = completed,
+                        total = total
+                    ));
                     return;
                 }
                 pending.set(None);
@@ -549,7 +569,7 @@ fn App() -> Element {
                         Operation::Inspect { .. } | Operation::Background | Operation::InspectFont
                     )
                 {
-                    message.set("The document changed. Please run that operation again.".into());
+                    message.set(fl!("the-document-changed-please-run-that-operation"));
                     return;
                 }
                 match response.result {
@@ -570,8 +590,9 @@ fn App() -> Element {
                                 match browser::ensure_font(&font.family, &font.bytes).await {
                                     Ok(()) => {
                                         editor.write().set_font(Some(font));
-                                        message.set(format!(
-                                            "Font “{label}” imported. It is embedded in exported PDFs and saved with the project."
+                                        message.set(fl!(
+                                            "font-imported-it-is-embedded-in-exported",
+                                            label = label
                                         ));
                                     }
                                     Err(error) => message.set(error),
@@ -616,7 +637,7 @@ fn App() -> Element {
                         match job.operation {
                             Operation::Proof { sheet: index } => {
                                 proof.set(Some((job.revision, index, url)));
-                                message.set("Proof rendered from the actual output PDF. Print at actual size (100%).".into());
+                                message.set(fl!("proof-rendered-from-the-actual-output-pdf"));
                             }
                             _ => {
                                 background.write().url = url;
@@ -624,7 +645,7 @@ fn App() -> Element {
                                     artwork_open.set(false);
                                     just_imported.set(false);
                                 }
-                                message.set("Artwork loaded. Ready to position numbers.".into());
+                                message.set(fl!("artwork-loaded-ready-to-position-numbers"));
                             }
                         }
                     }
@@ -639,8 +660,12 @@ fn App() -> Element {
                         let filename = format!("folio-sheets-{start}-{end}.pdf");
                         spawn(async move {
                             match browser::download(&bytes, &filename, "application/pdf").await {
-                                Ok(true) => message.set(format!("Exported sheets {start}–{end}. Print at actual size (100%), without fit-to-page.")),
-                                Ok(false) => message.set("Export canceled.".into()),
+                                Ok(true) => message.set(fl!(
+                                    "exported-sheets-print-at-actual-size-100",
+                                    start = start,
+                                    end = end
+                                )),
+                                Ok(false) => message.set(fl!("export-canceled")),
                                 Err(error) => message.set(error),
                             }
                         });
@@ -686,12 +711,12 @@ fn App() -> Element {
         match restore_project().await {
             Ok(Some((project, id))) => {
                 adopt_project(project, id, doc);
-                message.set("Restored your last local project.".into());
+                message.set(fl!("restored-your-last-local-project"));
             }
             Ok(None) => adopt_project(blank_project(&library.peek()), None, doc),
             Err(error) => {
                 adopt_project(blank_project(&library.peek()), None, doc);
-                message.set(format!("Could not restore your project: {error}"));
+                message.set(fl!("could-not-restore-your-project", error = error));
             }
         }
         restored.set(true);
@@ -705,7 +730,7 @@ fn App() -> Element {
         if *saved_revision.peek() == Some(revision) {
             return;
         }
-        save_status.set("Saving…".into());
+        save_status.set(fl!("saving"));
         let is_new = current_id.peek().is_none();
         spawn(async move {
             if !is_new {
@@ -716,7 +741,7 @@ fn App() -> Element {
             if editor.peek().revision == revision
                 && let Err(error) = autosave(doc).await
             {
-                save_status.set(format!("Autosave failed: {error}"));
+                save_status.set(fl!("autosave-failed", error = error));
             }
         });
     });
@@ -751,7 +776,7 @@ fn App() -> Element {
                 .unwrap_or_default();
             spawn(async move {
                 if let Err(error) = browser::ensure_font(&family, &bytes).await {
-                    message.set(format!("The preview is using the default font. {error}"));
+                    message.set(fl!("the-preview-is-using-the-default-font", error = error));
                 }
             });
         }
@@ -766,7 +791,7 @@ fn App() -> Element {
                     pending.set(None);
                     bridge.set(None);
                     worker_generation += 1;
-                    message.set("PDF operation timed out and was terminated. Try smaller artwork or fewer sheets.".into());
+                    message.set(fl!("pdf-operation-timed-out-and-was-terminated"));
                 }
             });
         }
@@ -842,9 +867,9 @@ fn App() -> Element {
         field.start.map(|s| s.to_string()).unwrap_or_default()
     };
     let start_placeholder = if mixed_start {
-        "Mixed".to_string()
+        fl!("mixed")
     } else {
-        format!("{} (project)", p.sequence.start)
+        fl!("project", number = p.sequence.start)
     };
     let free_placement = p.arrangement == Arrangement::Free;
     let proof_showing = current_proof.is_some();
@@ -855,107 +880,105 @@ fn App() -> Element {
     let font_label = p
         .font
         .as_ref()
-        .map_or("Noto Sans Regular (bundled)".to_string(), |f| {
-            f.name.clone()
-        });
+        .map_or(fl!("noto-sans-regular-bundled"), |f| f.name.clone());
     let prefix_gap = p.sequence.prefix_spacing_mm;
     let suffix_gap = p.sequence.suffix_spacing_mm;
 
     let pane_fields = rsx! {
-                    SidebarSection { title: "Number fields", badge: p.fields.len(), open: fields_open,
-                        p { class: "help", "Shift / Ctrl / ⌘ click to select multiple fields. Drag any selected field to move the group." }
+                    SidebarSection { title: fl!("number-fields"), badge: p.fields.len(), open: fields_open,
+                        p { class: "help", {fl!("shift-ctrl-click-to-select-multiple-fields")} }
                         div { class: "selection-actions",
-                            span { class: "badge", "{selection_count} selected" }
-                            button { class: "text-button", onclick: move |_| editor.write().select_all(), "Select all" }
+                            span { class: "badge", {fl!("selected", selection_count = selection_count)} }
+                            button { class: "text-button", onclick: move |_| editor.write().select_all(), {fl!("select-all")} }
                         }
                         div { class: "field-list",
                             for item in &p.fields {
                                 div { class: "field-row",
-                                input { r#type: "checkbox", aria_label: "Select Number {item.id}", checked: e.selected_ids.contains(&item.id),
+                                input { r#type: "checkbox", aria_label: fl!("select-number", id = item.id), checked: e.selected_ids.contains(&item.id),
                                     disabled: selection_count == 1 && e.selected_ids.contains(&item.id),
                                     onchange: { let id = item.id; move |_| editor.write().select(id, true) } }
                                 button { class: if e.selected_ids.contains(&item.id) { "field-item active" } else { "field-item" }, aria_pressed: e.selected_ids.contains(&item.id),
                                     onclick: { let id = item.id; move |event: MouseEvent| editor.write().select(id, event.modifiers().shift() || event.modifiers().ctrl() || event.modifiers().meta()) },
-                                    span { class: "field-symbol", "#" } span { "Number {item.id}" } small { "{item.font_size_pt:.0} pt" }
+                                    span { class: "field-symbol", "#" } span { {fl!("number", id = item.id)} } small { "{item.font_size_pt:.0} pt" }
                                 }
                                 }
                             }
                         }
                         div { class: "two-columns",
-                            button { class: "button outline", disabled: p.fields.len() >= 256, onclick: move |_| editor.write().add_field(), "Add" }
-                            button { class: "button quiet", disabled: p.fields.len() <= 1, onclick: move |_| editor.write().delete_field(), "Delete" }
+                            button { class: "button outline", disabled: p.fields.len() >= 256, onclick: move |_| editor.write().add_field(), {fl!("add")} }
+                            button { class: "button quiet", disabled: p.fields.len() <= 1, onclick: move |_| editor.write().delete_field(), {fl!("delete")} }
                         }
                     }
     };
     let pane_sequence = rsx! {
-                    SidebarSection { title: "Number sequence", number: "01", open: sequence_open,
+                    SidebarSection { title: fl!("number-sequence"), number: "01", open: sequence_open,
                         div { class: "two-columns",
-                            NumberInput { label: "Start at", value: p.sequence.start as f64, min: 0.0, max: 9_007_199_254_740_991.0,
+                            NumberInput { label: fl!("start-at"), value: p.sequence.start as f64, min: 0.0, max: 9_007_199_254_740_991.0,
                                 onchange: move |value| editor.write().edit(|p| p.sequence.start = value as u64) }
-                            NumberInput { label: "Quantity", value: p.sequence.quantity as f64, min: 1.0, max: 100_000.0,
+                            NumberInput { label: fl!("quantity"), value: p.sequence.quantity as f64, min: 1.0, max: 100_000.0,
                                 onchange: move |value| { editor.write().edit(|p| p.sequence.quantity = value as u64); export_end.set(editor.read().project.sheet_count().min(500)); } }
-                            NumberInput { label: "Increment", value: p.sequence.increment as f64, min: 1.0, max: 1_000_000.0,
+                            NumberInput { label: fl!("increment"), value: p.sequence.increment as f64, min: 1.0, max: 1_000_000.0,
                                 onchange: move |value| editor.write().edit(|p| p.sequence.increment = value as u64) }
-                            NumberInput { label: "Minimum digits", value: p.sequence.padding as f64, min: 0.0, max: 20.0,
+                            NumberInput { label: fl!("minimum-digits"), value: p.sequence.padding as f64, min: 0.0, max: 20.0,
                                 onchange: move |value| editor.write().edit(|p| p.sequence.padding = value as usize) }
-                            label { class: "control", span { "Prefix" } input { aria_label: "Prefix", maxlength: "100", value: "{p.sequence.prefix}",
+                            label { class: "control", span { {fl!("prefix")} } input { aria_label: fl!("prefix"), maxlength: "100", value: "{p.sequence.prefix}",
                                 oninput: move |event| editor.write().edit(|p| p.sequence.prefix = event.value()) } }
-                            label { class: "control", span { "Suffix" } input { aria_label: "Suffix", maxlength: "100", value: "{p.sequence.suffix}",
+                            label { class: "control", span { {fl!("suffix")} } input { aria_label: fl!("suffix"), maxlength: "100", value: "{p.sequence.suffix}",
                                 oninput: move |event| editor.write().edit(|p| p.sequence.suffix = event.value()) } }
-                            NumberInput { label: "Prefix spacing · mm", value: p.sequence.prefix_spacing_mm, min: 0.0, max: 50.0, step: 0.1,
+                            NumberInput { label: fl!("prefix-spacing-mm"), value: p.sequence.prefix_spacing_mm, min: 0.0, max: 50.0, step: 0.1,
                                 onchange: move |value| editor.write().edit(|p| p.sequence.prefix_spacing_mm = value) }
-                            NumberInput { label: "Suffix spacing · mm", value: p.sequence.suffix_spacing_mm, min: 0.0, max: 50.0, step: 0.1,
+                            NumberInput { label: fl!("suffix-spacing-mm"), value: p.sequence.suffix_spacing_mm, min: 0.0, max: 50.0, step: 0.1,
                                 onchange: move |value| editor.write().edit(|p| p.sequence.suffix_spacing_mm = value) }
                         }
-                        label { class: "control", span { "Numbering order" }
-                            select { aria_label: "Numbering order", value: if p.sequence.order == Order::Sequential { "sequential" } else { "cut-stack" },
+                        label { class: "control", span { {fl!("numbering-order")} }
+                            select { aria_label: fl!("numbering-order"), value: if p.sequence.order == Order::Sequential { "sequential" } else { "cut-stack" },
                                 onchange: move |event| editor.write().edit(|p| p.sequence.order = if event.value() == "cut-stack" { Order::CutAndStack } else { Order::Sequential }),
-                                option { value: "sequential", "Across each sheet" } option { value: "cut-stack", "Cut & stack" }
+                                option { value: "sequential", {fl!("across-each-sheet")} } option { value: "cut-stack", {fl!("cut-stack")} }
                             }
                         }
                         label { class: "checkbox-control", input { r#type: "checkbox", checked: p.sequence.reverse,
-                            onchange: move |event| { let on = event.checked(); editor.write().edit(|p| p.sequence.reverse = on); } } "Reverse numbering" }
-                        p { class: "help", if p.sequence.reverse { "Counting down: the same numbers, printed from the highest to the lowest." } else { "Turn on to print the same numbers from the highest to the lowest." } }
-                        p { class: "help", if free_placement { "One sequence number per sheet; all fields on that sheet share it." } else if p.sequence.order == Order::CutAndStack { "Stack sheets in order, cut, then gather cells left-to-right, top-to-bottom. Unused tail cells stay blank." } else { "Numbers flow left-to-right, top-to-bottom on each sheet." } }
-                        div { class: "sequence-sample", title: "First number printed", "{p.format_number(first_number)}" }
+                            onchange: move |event| { let on = event.checked(); editor.write().edit(|p| p.sequence.reverse = on); } } {fl!("reverse-numbering")} }
+                        p { class: "help", if p.sequence.reverse { {fl!("counting-down-the-same-numbers-printed-from")} } else { {fl!("turn-on-to-print-the-same-numbers")} } }
+                        p { class: "help", if free_placement { {fl!("one-sequence-number-per-sheet-all-fields")} } else if p.sequence.order == Order::CutAndStack { {fl!("stack-sheets-in-order-cut-then-gather")} } else { {fl!("numbers-flow-left-to-right-top-to")} } }
+                        div { class: "sequence-sample", title: fl!("first-number-printed"), "{p.format_number(first_number)}" }
                     }
     };
     let pane_layout = rsx! {
-                    SidebarSection { title: "Sheet layout", number: "02", open: layout_open,
-                        label { class: "control", span { "Arrangement" }
-                            select { aria_label: "Arrangement", value: if free_placement { "free" } else { "grid" },
+                    SidebarSection { title: fl!("sheet-layout"), number: "02", open: layout_open,
+                        label { class: "control", span { {fl!("arrangement")} }
+                            select { aria_label: fl!("arrangement"), value: if free_placement { "free" } else { "grid" },
                                 onchange: move |event| {
                                     drag.set(None);
                                     editor.write().set_arrangement(if event.value() == "free" { Arrangement::Free } else { Arrangement::Grid });
                                 },
-                                option { value: "grid", "Grid" }
-                                option { value: "free", "Free placement" }
+                                option { value: "grid", {fl!("grid")} }
+                                option { value: "free", {fl!("free-placement")} }
                             }
                         }
                         if free_placement {
-                            p { class: "help", "Position fields anywhere on the page. Each field has an X and Y guide; drag another field near a guide to align its anchor." }
+                            p { class: "help", {fl!("position-fields-anywhere-on-the-page-each")} }
                             label { class: "checkbox-control", input { r#type: "checkbox", checked: show_guides(),
-                                onchange: move |event| show_guides.set(event.checked()) } "Show anchor guides" }
+                                onchange: move |event| show_guides.set(event.checked()) } {fl!("show-anchor-guides")} }
                             label { class: "checkbox-control", input { r#type: "checkbox", checked: snap_guides(), disabled: !show_guides(),
-                                onchange: move |event| snap_guides.set(event.checked()) } "Snap to anchor guides" }
-                            p { class: "help guide-help", "Guides are editing aids only; they never print. Snapping aligns positions, without linking future movement." }
+                                onchange: move |event| snap_guides.set(event.checked()) } {fl!("snap-to-anchor-guides")} }
+                            p { class: "help guide-help", {fl!("guides-are-editing-aids-only-they-never")} }
                         } else {
                         div { class: "two-columns",
-                            NumberInput { label: "Columns", value: p.grid.columns as f64, min: 1.0, max: 20.0,
+                            NumberInput { label: fl!("columns"), value: p.grid.columns as f64, min: 1.0, max: 20.0,
                                 onchange: move |value| editor.write().edit(|p| { p.grid.columns = value as u32; clamp_fields(p); }) }
-                            NumberInput { label: "Rows", value: p.grid.rows as f64, min: 1.0, max: 20.0,
+                            NumberInput { label: fl!("rows"), value: p.grid.rows as f64, min: 1.0, max: 20.0,
                                 onchange: move |value| editor.write().edit(|p| { p.grid.rows = value as u32; clamp_fields(p); }) }
-                            NumberInput { label: "Margin · mm", value: p.grid.margin_mm, min: 0.0, max: 200.0, step: 0.5,
+                            NumberInput { label: fl!("margin-mm"), value: p.grid.margin_mm, min: 0.0, max: 200.0, step: 0.5,
                                 onchange: move |value| editor.write().edit(|p| { p.grid.margin_mm = value; clamp_fields(p); }) }
-                            NumberInput { label: "Gap · mm", value: p.grid.gap_mm, min: 0.0, max: 200.0, step: 0.5,
+                            NumberInput { label: fl!("gap-mm"), value: p.grid.gap_mm, min: 0.0, max: 200.0, step: 0.5,
                                 onchange: move |value| editor.write().edit(|p| { p.grid.gap_mm = value; clamp_fields(p); }) }
                         }
-                        p { class: "help", "One item per cell. Every number field within a cell prints the same number." }
+                        p { class: "help", {fl!("one-item-per-cell-every-number-field")} }
                         }
                     }
     };
     let pane_artwork = rsx! {
-                    SidebarSection { title: "Artwork & paper", number: "03", open: artwork_open,
+                    SidebarSection { title: fl!("artwork-paper"), number: "03", open: artwork_open,
                         button { class: "upload-button", disabled: busy || !restored() || !worker_available, onclick: move |_| {
                             // Open the picker inside the click handler so it still counts as a user gesture.
                             let picking = browser::pick_file(browser::FileKind::Artwork);
@@ -969,80 +992,80 @@ fn App() -> Element {
                                 let kind = if bytes.starts_with(b"%PDF-") { ArtworkKind::Pdf }
                                     else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { ArtworkKind::Png }
                                     else if bytes.starts_with(b"\xff\xd8\xff") { ArtworkKind::Jpeg }
-                                    else { message.set("Choose a PDF, PNG, or JPEG file.".into()); return; };
+                                    else { message.set(fl!("choose-a-pdf-png-or-jpeg-file")); return; };
                                 let mut p = editor.read().project.clone();
                                 p.artwork = Some(Artwork { name, kind, bytes, page_index: 0, scale_percent: 100.0, offset_x_mm: 0.0, offset_y_mm: 0.0 });
                                 editor.write().replace(p); background.set(Background::default()); proof.set(None);
                                 just_imported.set(true);
                                 send_job(bridge, pending, serial, editor, Operation::Inspect { adopt_page_size: true });
-                                message.set("Opening artwork in the Rust PDF worker…".into());
+                                message.set(fl!("opening-artwork-in-the-rust-pdf-worker"));
                             });
                         },
-                            span { class: "upload-icon", "+" } strong { if p.artwork.is_some() { "Replace artwork" } else { "Import artwork" } }
-                            span { "PDF, PNG or JPEG · up to 20 MB" }
+                            span { class: "upload-icon", "+" } strong { if p.artwork.is_some() { {fl!("replace-artwork")} } else { {fl!("import-artwork")} } }
+                            span { {fl!("pdf-png-or-jpeg-up-to-20")} }
                         }
                         if let Some(art) = &p.artwork {
                             div { class: "artwork-info", span { "{art.name}" }
                                 button { class: "text-button", disabled: busy, onclick: move |_| {
                                     let mut e = editor.write(); e.project.artwork = None; e.revision += 1;
                                     background.set(Background::default()); proof.set(None);
-                                }, "Remove" }
+                                }, {fl!("remove")} }
                             }
                             if bg.pages > 1 {
-                                NumberInput { label: "Artwork page", value: (art.page_index + 1) as f64, min: 1.0, max: bg.pages as f64,
+                                NumberInput { label: fl!("artwork-page"), value: (art.page_index + 1) as f64, min: 1.0, max: bg.pages as f64,
                                     onchange: move |value| {
                                         editor.write().edit(|p| { if let Some(a) = &mut p.artwork { a.page_index = value as usize - 1; } });
                                         proof.set(None); send_job(bridge, pending, serial, editor, Operation::Inspect { adopt_page_size: false });
                                     }
                                 }
                             }
-                            NumberInput { label: "Artwork scale · %", value: art.scale_percent, min: numbering_core::MIN_ARTWORK_SCALE, max: numbering_core::MAX_ARTWORK_SCALE, step: 1.0,
+                            NumberInput { label: fl!("artwork-scale"), value: art.scale_percent, min: numbering_core::MIN_ARTWORK_SCALE, max: numbering_core::MAX_ARTWORK_SCALE, step: 1.0,
                                 onchange: move |value| {
                                     editor.write().edit(|p| { if let Some(a) = &mut p.artwork { a.scale_percent = value; } });
                                     proof.set(None);
                                 } }
                             div { class: "two-columns",
-                                NumberInput { label: "Artwork X · mm", value: art.offset_x_mm, min: -numbering_core::MAX_ARTWORK_OFFSET_MM, max: numbering_core::MAX_ARTWORK_OFFSET_MM, step: 0.1,
+                                NumberInput { label: fl!("artwork-x-mm"), value: art.offset_x_mm, min: -numbering_core::MAX_ARTWORK_OFFSET_MM, max: numbering_core::MAX_ARTWORK_OFFSET_MM, step: 0.1,
                                     onchange: move |value| { editor.write().edit(|p| { if let Some(a) = &mut p.artwork { a.offset_x_mm = value; } }); } }
-                                NumberInput { label: "Artwork Y · mm", value: art.offset_y_mm, min: -numbering_core::MAX_ARTWORK_OFFSET_MM, max: numbering_core::MAX_ARTWORK_OFFSET_MM, step: 0.1,
+                                NumberInput { label: fl!("artwork-y-mm"), value: art.offset_y_mm, min: -numbering_core::MAX_ARTWORK_OFFSET_MM, max: numbering_core::MAX_ARTWORK_OFFSET_MM, step: 0.1,
                                     onchange: move |value| { editor.write().edit(|p| { if let Some(a) = &mut p.artwork { a.offset_y_mm = value; } }); } }
                             }
                             div { class: "two-columns",
                                 button { class: if art_move() { "button outline active" } else { "button outline" }, aria_pressed: art_move(), onclick: move |_| art_move.toggle(),
-                                    if art_move() { "Done moving" } else { "Move artwork" } }
-                                button { class: "button quiet", disabled: art.is_centered(), onclick: move |_| { editor.write().edit(|p| { if let Some(a) = &mut p.artwork { a.offset_x_mm = 0.0; a.offset_y_mm = 0.0; } }); }, "Center" }
+                                    if art_move() { {fl!("done-moving")} } else { {fl!("move-artwork")} } }
+                                button { class: "button quiet", disabled: art.is_centered(), onclick: move |_| { editor.write().edit(|p| { if let Some(a) = &mut p.artwork { a.offset_x_mm = 0.0; a.offset_y_mm = 0.0; } }); }, {fl!("center")} }
                             }
-                            p { class: "help", if art_move() { "Drag the artwork, or focus the sheet and use arrow keys (Shift = 1 mm, Home = center, Esc = done). Numbers are locked meanwhile; it snaps to center when close." } else { "Artwork fits proportionally on the sheet; scale and move it from the centre (100% and 0 mm = fitted and centered). PDF import uses the selected page size." } }
+                            p { class: "help", if art_move() { {fl!("drag-the-artwork-or-focus-the-sheet")} } else { {fl!("artwork-fits-proportionally-on-the-sheet-scale")} } }
                         }
-                        label { class: "control", span { "Paper preset" }
-                            select { aria_label: "Paper preset", value: "custom", onchange: move |event| {
+                        label { class: "control", span { {fl!("paper-preset")} }
+                            select { aria_label: fl!("paper-preset"), value: "custom", onchange: move |event| {
                                 let size = match event.value().as_str() { "a4" => Some((210.0,297.0)), "letter" => Some((215.9,279.4)), "a3" => Some((297.0,420.0)), _ => None };
                                 if let Some((w,h)) = size { editor.write().edit(|p| { p.page.width_mm = w; p.page.height_mm = h; clamp_fields(p); }); }
                             },
-                                option { value: "custom", "Custom / imported" } option { value: "a4", "A4" }
-                                option { value: "letter", "US Letter" } option { value: "a3", "A3" }
+                                option { value: "custom", {fl!("custom-imported")} } option { value: "a4", "A4" }
+                                option { value: "letter", {fl!("us-letter")} } option { value: "a3", "A3" }
                             }
                         }
                         div { class: "two-columns",
-                            NumberInput { label: "Width · mm", value: page_width, min: 10.0, max: 2000.0, step: 0.1,
+                            NumberInput { label: fl!("width-mm"), value: page_width, min: 10.0, max: 2000.0, step: 0.1,
                                 onchange: move |value| editor.write().edit(|p| { p.page.width_mm = value; clamp_fields(p); }) }
-                            NumberInput { label: "Height · mm", value: page_height, min: 10.0, max: 2000.0, step: 0.1,
+                            NumberInput { label: fl!("height-mm"), value: page_height, min: 10.0, max: 2000.0, step: 0.1,
                                 onchange: move |value| editor.write().edit(|p| { p.page.height_mm = value; clamp_fields(p); }) }
                         }
                     }
     };
     let pane_props = rsx! {
-                    SidebarSection { title: "Field properties", open: props_open,
-                        if selection_count > 1 { p { class: "help selection-summary", "Editing {selection_count} fields. X/Y move the group relative to Number {selected}; other properties apply to all selected fields." } }
-                        p { class: "help", if free_placement { "Baseline anchor, measured from the page’s top-left corner." } else { "Baseline position, relative to each cell." } }
+                    SidebarSection { title: fl!("field-properties"), open: props_open,
+                        if selection_count > 1 { p { class: "help selection-summary", {fl!("editing-fields-x-y-move-the-group", selection_count = selection_count, selected = selected)} } }
+                        p { class: "help", if free_placement { {fl!("baseline-anchor-measured-from-the-page-s")} } else { {fl!("baseline-position-relative-to-each-cell")} } }
                         div { class: "two-columns",
                             NumberInput { label: "X · mm", value: field.x_mm, min: 0.0, max: cell_width.max(0.0), step: 0.1,
                                 onchange: move |value| { let x = editor.read().field().map_or(0.0, |f| f.x_mm); editor.write().move_selection(value - x, 0.0); } }
                             NumberInput { label: "Y · mm", value: field.y_mm, min: 0.0, max: cell_height.max(0.0), step: 0.1,
                                 onchange: move |value| { let y = editor.read().field().map_or(0.0, |f| f.y_mm); editor.write().move_selection(0.0, value - y); } }
                         }
-                        label { class: "control", span { "Start number" }
-                            input { r#type: "number", aria_label: "Start number", min: "0", step: "1", value: "{start_value}", placeholder: "{start_placeholder}",
+                        label { class: "control", span { {fl!("start-number")} }
+                            input { r#type: "number", aria_label: fl!("start-number"), min: "0", step: "1", value: "{start_value}", placeholder: "{start_placeholder}",
                                 onchange: move |event| {
                                     let text = event.value();
                                     let text = text.trim();
@@ -1055,9 +1078,9 @@ fn App() -> Element {
                                     }
                                 } }
                         }
-                        p { class: "help", "Blank follows the project's “Start at”. Each field counts up from its own start." }
+                        p { class: "help", {fl!("blank-follows-the-project-s-start-at")} }
                         div { class: "control font-control",
-                            span { "Typeface · all fields" }
+                            span { {fl!("typeface-all-fields")} }
                             div { class: "font-name", title: "{font_label}", "{font_label}" }
                             div { class: "two-columns",
                                 button { class: "button outline", disabled: busy || !restored() || !worker_available,
@@ -1070,55 +1093,55 @@ fn App() -> Element {
                                                 Err(error) => { message.set(error); return; }
                                             }) else { return; };
                                             let font = CustomFont::new(file.name, file.bytes);
-                                            message.set("Checking the font…".into());
+                                            message.set(fl!("checking-the-font"));
                                             let candidate = Project { font: Some(font.clone()), ..Default::default() };
                                             candidate_font.set(Some(font));
                                             let revision = editor.peek().revision;
                                             send_request(bridge, pending, serial, revision, candidate, Operation::InspectFont);
                                         });
-                                    }, "Import font…" }
+                                    }, {fl!("import-font")} }
                                 button { class: "button quiet", disabled: p.font.is_none(),
-                                    onclick: move |_| { editor.write().set_font(None); message.set("Using the bundled Noto Sans font.".into()); }, "Use default" }
+                                    onclick: move |_| { editor.write().set_font(None); message.set(fl!("using-the-bundled-noto-sans-font")); }, {fl!("use-default")} }
                             }
                         }
                         div { class: "two-columns",
-                            NumberInput { label: "Size · pt", value: field.font_size_pt, mixed: mixed_size, min: 1.0, max: 300.0, step: 0.5,
+                            NumberInput { label: fl!("size-pt"), value: field.font_size_pt, mixed: mixed_size, min: 1.0, max: 300.0, step: 0.5,
                                 onchange: move |value| editor.write().edit_field(|f| f.font_size_pt = value) }
-                            label { class: "control", span { if mixed_color { "Colour (mixed)" } else { "Colour" } } input { r#type: "color", aria_label: "Field colour", value: "{field.color}",
+                            label { class: "control", span { if mixed_color { {fl!("colour-mixed")} } else { {fl!("colour")} } } input { r#type: "color", aria_label: fl!("field-colour"), value: "{field.color}",
                                 oninput: move |event| editor.write().edit_field(|f| f.color = event.value()) } }
                         }
-                        label { class: "control", span { "Rotation" } select { aria_label: "Rotation", value: if mixed_rotation { "mixed".to_string() } else { field.rotation.degrees().to_string() },
+                        label { class: "control", span { {fl!("rotation")} } select { aria_label: fl!("rotation"), value: if mixed_rotation { "mixed".to_string() } else { field.rotation.degrees().to_string() },
                             onchange: move |event| editor.write().edit_field(|f| f.rotation = match event.value().as_str() { "90" => Rotation::Deg90, "180" => Rotation::Deg180, "270" => Rotation::Deg270, _ => Rotation::Deg0 }),
-                            if mixed_rotation { option { value: "mixed", disabled: true, "Mixed" } }
+                            if mixed_rotation { option { value: "mixed", disabled: true, {fl!("mixed")} } }
                             option { value: "0", "0°" } option { value: "90", "90°" } option { value: "180", "180°" } option { value: "270", "270°" }
                         } }
-                        label { class: "control", span { "Alignment" } select { aria_label: "Alignment", value: if mixed_alignment { "mixed" } else { match field.alignment { Alignment::Left => "left", Alignment::Center => "center", Alignment::Right => "right" } },
+                        label { class: "control", span { {fl!("alignment")} } select { aria_label: fl!("alignment"), value: if mixed_alignment { "mixed" } else { match field.alignment { Alignment::Left => "left", Alignment::Center => "center", Alignment::Right => "right" } },
                             onchange: move |event| editor.write().edit_field(|f| f.alignment = match event.value().as_str() { "center" => Alignment::Center, "right" => Alignment::Right, _ => Alignment::Left }),
-                            if mixed_alignment { option { value: "mixed", disabled: true, "Mixed" } }
-                            option { value: "left", "Left" } option { value: "center", "Centre" } option { value: "right", "Right" }
+                            if mixed_alignment { option { value: "mixed", disabled: true, {fl!("mixed")} } }
+                            option { value: "left", {fl!("left")} } option { value: "center", {fl!("centre")} } option { value: "right", {fl!("right")} }
                         } }
-                        label { class: "checkbox-control", input { r#type: "checkbox", checked: snap(), onchange: move |event| snap.set(event.checked()) } "Snap to 0.5 mm" }
+                        label { class: "checkbox-control", input { r#type: "checkbox", checked: snap(), onchange: move |event| snap.set(event.checked()) } {fl!("snap-to-0-5-mm")} }
                     }
     };
     let pane_export = rsx! {
-                    SidebarSection { title: "Export your job", class: "export-panel", open: export_open,
-                        p { class: "eyebrow", "READY FOR THE PRESS" }
-                        p { class: "help", "Vector PDF · Embedded fonts · No uploads" }
+                    SidebarSection { title: fl!("export-your-job"), class: "export-panel", open: export_open,
+                        p { class: "eyebrow", {fl!("ready-for-the-press")} }
+                        p { class: "help", {fl!("vector-pdf-embedded-fonts-no-uploads")} }
                         div { class: "two-columns",
-                            NumberInput { label: "First sheet", value: export_start() as f64, min: 1.0, max: sheet_count as f64,
+                            NumberInput { label: fl!("first-sheet"), value: export_start() as f64, min: 1.0, max: sheet_count as f64,
                                 onchange: move |value| export_start.set(value as usize) }
-                            NumberInput { label: "Last sheet", value: export_end() as f64, min: 1.0, max: sheet_count as f64,
+                            NumberInput { label: fl!("last-sheet"), value: export_end() as f64, min: 1.0, max: sheet_count as f64,
                                 onchange: move |value| export_end.set(value as usize) }
                         }
                         button { class: "button primary full-width", disabled: busy || !restored() || validation.is_some() || !worker_available, onclick: move |_| {
                             let start = export_start(); let end = export_end();
                             if start == 0 || end < start || end > editor.read().project.sheet_count() || end - start + 1 > 500 {
-                                message.set("Choose a valid range of at most 500 sheets. Export larger jobs in chunks.".into()); return;
+                                message.set(fl!("choose-a-valid-range-of-at-most")); return;
                             }
-                            message.set(format!("Generating sheets {start}–{end} in the PDF worker…"));
+                            message.set(fl!("generating-sheets-in-the-pdf-worker", start = start, end = end));
                             send_job(bridge, pending, serial, editor, Operation::Export { start_sheet: start - 1, end_sheet: end });
-                        }, if busy { "Processing…" } else { "Download PDF ↓" } }
-                        p { class: "help", "Up to 500 sheets per export. Print at actual size (100%). Single-sided output." }
+                        }, if busy { {fl!("processing")} } else { {fl!("download-pdf")} } }
+                        p { class: "help", {fl!("up-to-500-sheets-per-export-print")} }
                     }
     };
     let pane = |id: &str| -> Element {
@@ -1132,15 +1155,15 @@ fn App() -> Element {
         }
     };
     rsx! {
-        document::Title { "Folio — precise numbering" }
-        document::Meta { name: "description", content: "Private, local-first ticket and form numbering. Built in Rust." }
+        document::Title { {fl!("folio-precise-numbering")} }
+        document::Meta { name: "description", content: fl!("private-local-first-ticket-and-form-numbering") }
         document::Meta { name: "theme-color", content: "#153f39" }
         document::Link { rel: "icon", r#type: "image/svg+xml", href: asset!("/assets/folio.svg") }
         document::Stylesheet { href: asset!("/assets/styles.css") }
         div { class: "app-shell",
             if !library_open() {
             header { class: "app-header",
-                button { class: "header-icon-button", aria_label: "Project library", title: "Project library", disabled: !restored(),
+                button { class: "header-icon-button", aria_label: fl!("project-library"), title: fl!("project-library"), disabled: !restored(),
                     onclick: move |_| {
                         library_open.set(true);
                         deleting_project.set(None);
@@ -1158,19 +1181,19 @@ fn App() -> Element {
                         path { d: SQUIRCLE, fill: "#175c4c" }
                         text { x: "49", y: "62", text_anchor: "middle", font_family: "Georgia, 'Times New Roman', serif", font_style: "italic", font_size: "62", fill: "white", "f" }
                     }
-                    div { strong { "folio" } span { "NUMBERING STUDIO" } }
+                    div { strong { "folio" } span { {fl!("numbering-studio")} } }
                 }
                 div { class: "header-document",
-                    input { class: "project-title", aria_label: "Project name", title: "{p.name}", maxlength: "200", value: "{p.name}", disabled: !restored(),
+                    input { class: "project-title", aria_label: fl!("project-name"), title: "{p.name}", maxlength: "200", value: "{p.name}", disabled: !restored(),
                         oninput: move |event| editor.write().edit(|p| p.name = event.value()) }
                 }
-                div { class: "job-summary", strong { "{p.sequence.quantity}" } span { "items" } i {} strong { "{sheet_count}" } span { "sheets" } }
+                div { class: "job-summary", strong { "{p.sequence.quantity}" } span { {fl!("item-count-label", count = p.sequence.quantity)} } i {} strong { "{sheet_count}" } span { {fl!("sheet-count-label", count = sheet_count)} } }
                 div { class: "mobile-sidebar-controls",
-                    button { class: "button outline", aria_expanded: mobile_panel() == Some("settings"), onclick: move |_| mobile_panel.set(if mobile_panel() == Some("settings") { None } else { Some("settings") }), "Settings" }
-                    button { class: "button outline", aria_expanded: mobile_panel() == Some("fields"), onclick: move |_| mobile_panel.set(if mobile_panel() == Some("fields") { None } else { Some("fields") }), "Fields" }
+                    button { class: "button outline", aria_expanded: mobile_panel() == Some("settings"), onclick: move |_| mobile_panel.set(if mobile_panel() == Some("settings") { None } else { Some("settings") }), {fl!("settings")} }
+                    button { class: "button outline", aria_expanded: mobile_panel() == Some("fields"), onclick: move |_| mobile_panel.set(if mobile_panel() == Some("fields") { None } else { Some("fields") }), {fl!("fields")} }
                 }
                 div { class: "header-actions",
-                    button { class: "button quiet", aria_label: "Export project to a file", disabled: !restored() || validation.is_some(),
+                    button { class: "button quiet", aria_label: fl!("export-project-to-a-file"), disabled: !restored() || validation.is_some(),
                         onclick: move |_| {
                             let (bytes, name) = {
                                 let editor = editor.read();
@@ -1180,17 +1203,17 @@ fn App() -> Element {
                                 }
                             };
                             export_project(bytes, &name, message);
-                        }, "Export" span { class: "action-detail", " file" } }
-                    button { class: "button outline", aria_label: "New project", disabled: !restored(),
+                        }, {fl!("export")} span { class: "action-detail", {fl!("export-file-detail")} } }
+                    button { class: "button outline", aria_label: fl!("new-project"), disabled: !restored(),
                         onclick: move |_| request_replace(PendingReplace::New, doc, pending_replace),
-                        "New" span { class: "action-detail", " project" } }
+                        {fl!("new-project-short")} span { class: "action-detail", {fl!("new-project-detail")} } }
                 }
             }
             main { class: "workspace", aria_busy: !restored(),
                 if mobile_panel().is_some() {
-                    button { class: "sidebar-backdrop", aria_label: "Close sidebar", onclick: move |_| mobile_panel.set(None) }
+                    button { class: "sidebar-backdrop", aria_label: fl!("close-sidebar"), onclick: move |_| mobile_panel.set(None) }
                 }
-                aside { class: if mobile_panel() == Some("settings") { "sidebar left-sidebar mobile-open" } else { "sidebar left-sidebar" }, aria_label: "Project settings",
+                aside { class: if mobile_panel() == Some("settings") { "sidebar left-sidebar mobile-open" } else { "sidebar left-sidebar" }, aria_label: fl!("project-settings"),
                     for id in pane_order().0.clone() {
                         PaneSlot { key: "{id}", id, dragging: dragging_pane, target: drop_target, order: pane_order, {pane(id)} }
                     }
@@ -1198,24 +1221,24 @@ fn App() -> Element {
                 section { class: "canvas-panel",
                     div { class: "canvas-toolbar",
                         div { class: "segmented",
-                            button { class: if current_proof.is_none() { "active" } else { "" }, onclick: move |_| proof.set(None), "Layout" }
+                            button { class: if current_proof.is_none() { "active" } else { "" }, onclick: move |_| proof.set(None), {fl!("layout")} }
                             button { class: if current_proof.is_some() { "active" } else { "" }, disabled: busy || validation.is_some() || !restored() || !worker_available, onclick: move |_| {
                                 send_job(bridge, pending, serial, editor, Operation::Proof { sheet: active_sheet });
-                                message.set("Rendering an output-PDF proof…".into());
-                            }, "PDF proof" }
+                                message.set(fl!("rendering-an-output-pdf-proof"));
+                            }, {fl!("pdf-proof")} }
                         }
                         div { class: "toolbar-controls",
-                            button { class: "icon-button", aria_label: "Undo", title: "Undo", disabled: !e.can_undo(), onclick: move |_| editor.write().undo(), "↶" }
-                            button { class: "icon-button", aria_label: "Redo", title: "Redo", disabled: !e.can_redo(), onclick: move |_| editor.write().redo(), "↷" }
-                            select { aria_label: "Zoom", value: "{zoom()}", onchange: move |event| { if let Ok(value) = event.value().parse() { zoom.set(value); } },
-                                option { value: "1", "Fit to view" } option { value: "0.75", "75% of fit" } option { value: "0.5", "50% of fit" }
+                            button { class: "icon-button", aria_label: fl!("undo"), title: fl!("undo"), disabled: !e.can_undo(), onclick: move |_| editor.write().undo(), "↶" }
+                            button { class: "icon-button", aria_label: fl!("redo"), title: fl!("redo"), disabled: !e.can_redo(), onclick: move |_| editor.write().redo(), "↷" }
+                            select { aria_label: fl!("zoom"), value: "{zoom()}", onchange: move |event| { if let Ok(value) = event.value().parse() { zoom.set(value); } },
+                                option { value: "1", {fl!("fit-to-view")} } option { value: "0.75", {fl!("fit-scale-75")} } option { value: "0.5", {fl!("fit-scale-50")} }
                             }
                         }
                     }
                     div { class: "canvas-scroll", style: "--page-ratio: {page_width / page_height}; --preview-scale: {zoom()};",
                         div { class: "paper-wrapper",
                             div { class: "paper-size-label", "{page_width:.1} × {page_height:.1} mm" }
-                            svg { id: "page-editor", class: if art_move() { "paper moving-artwork" } else { "paper" }, role: "img", "aria-label": "Numbering layout, drag a number to move it", tabindex: "0",
+                            svg { id: "page-editor", class: if art_move() { "paper moving-artwork" } else { "paper" }, role: "img", "aria-label": fl!("numbering-layout-drag-a-number-to-move"), tabindex: "0",
                                 view_box: "0 0 {page_width} {page_height}", width: "100%", style: "aspect-ratio: {page_width} / {page_height}; touch-action: none;",
                                 onpointerdown: move |event| {
                                     if proof_showing || event.trigger_button() != Some(dioxus::html::input_data::MouseButton::Primary) { return; }
@@ -1373,9 +1396,9 @@ fn App() -> Element {
                     }
                     div { class: "canvas-footer",
                         div { class: "sheet-navigation",
-                            button { class: "icon-button", aria_label: "Previous sheet", disabled: active_sheet == 0, onclick: move |_| sheet.set(active_sheet.saturating_sub(1)), "‹" }
-                            span { class: "sheet-jump", "Sheet"
-                                input { id: "sheet-number", r#type: "number", aria_label: "Sheet number", min: "1", max: "{last_sheet}", step: "1", value: "{active_sheet + 1}",
+                            button { class: "icon-button", aria_label: fl!("previous-sheet"), disabled: active_sheet == 0, onclick: move |_| sheet.set(active_sheet.saturating_sub(1)), "‹" }
+                            span { class: "sheet-jump", {fl!("sheet")}
+                                input { id: "sheet-number", r#type: "number", aria_label: fl!("sheet-number"), min: "1", max: "{last_sheet}", step: "1", value: "{active_sheet + 1}",
                                     onchange: move |event| {
                                         let text = event.value();
                                         let text = text.trim();
@@ -1389,20 +1412,20 @@ fn App() -> Element {
                                         };
                                         browser::set_input_value("sheet-number", &shown.to_string());
                                     } }
-                                "of {sheet_count}"
+                                {fl!("of", sheet_count = sheet_count)}
                             }
-                            button { class: "icon-button", aria_label: "Next sheet", disabled: active_sheet + 1 >= sheet_count, onclick: move |_| sheet.set((active_sheet + 1).min(last_sheet - 1)), "›" }
+                            button { class: "icon-button", aria_label: fl!("next-sheet"), disabled: active_sheet + 1 >= sheet_count, onclick: move |_| sheet.set((active_sheet + 1).min(last_sheet - 1)), "›" }
                         }
-                        span { class: "help", if current_proof.is_some() { "Output-PDF proof" } else if free_placement { "Drag near a guide to align · Drag empty space to select · Arrow keys to nudge" } else { "Drag to position · Drag empty space to select · Arrow keys to nudge" } }
+                        span { class: "help", if current_proof.is_some() { {fl!("output-pdf-proof")} } else if free_placement { {fl!("drag-near-a-guide-to-align-drag")} } else { {fl!("drag-to-position-drag-empty-space-to")} } }
                     }
                 }
-                aside { class: if mobile_panel() == Some("fields") { "sidebar right-sidebar mobile-open" } else { "sidebar right-sidebar" }, aria_label: "Number fields and properties",
+                aside { class: if mobile_panel() == Some("fields") { "sidebar right-sidebar mobile-open" } else { "sidebar right-sidebar" }, aria_label: fl!("number-fields-and-properties"),
                     for id in pane_order().1.clone() {
                         PaneSlot { key: "{id}", id, dragging: dragging_pane, target: drop_target, order: pane_order, {pane(id)} }
                     }
                 }
             }
-            if let Some(error) = &validation { div { class: "validation", role: "alert", "{error}" } }
+            if let Some(error) = &validation { div { class: "validation", role: "alert", {i18n::message(error)} } }
             }
             if library_open() {
                 main { class: "library-view", aria_labelledby: "library-title", aria_busy: !restored(),
@@ -1410,16 +1433,16 @@ fn App() -> Element {
                     div { class: "library-content",
                         header { class: "library-header",
                             div {
-                                h1 { id: "library-title", "Project library" }
-                                p { "Saved inside Folio on this device." }
+                                h1 { id: "library-title", {fl!("project-library")} }
+                                p { {fl!("saved-inside-folio-on-this-device")} }
                             }
-                            button { class: "button outline", disabled: !restored(), onclick: move |_| library_open.set(false), "Back to editor" }
+                            button { class: "button outline", disabled: !restored(), onclick: move |_| library_open.set(false), {fl!("back-to-editor")} }
                         }
                         div { class: "library-actions",
-                            button { class: "header-icon-button", title: "New project", aria_label: "New project", disabled: !restored(),
+                            button { class: "header-icon-button", title: fl!("new-project"), aria_label: fl!("new-project"), disabled: !restored(),
                                 onclick: move |_| request_replace(PendingReplace::New, doc, pending_replace),
                                 {action_icon(NEW_ICON)} }
-                            button { class: "header-icon-button", title: "Export current project", aria_label: "Export current project", disabled: !restored() || validation.is_some(),
+                            button { class: "header-icon-button", title: fl!("export-current-project"), aria_label: fl!("export-current-project"), disabled: !restored() || validation.is_some(),
                                 onclick: move |_| {
                                     let (bytes, name) = {
                                         let editor = editor.read();
@@ -1430,7 +1453,7 @@ fn App() -> Element {
                                     };
                                     export_project(bytes, &name, message);
                                 }, {action_icon(EXPORT_ICON)} }
-                            button { class: "header-icon-button", title: "Import project", aria_label: "Import project", disabled: !restored(),
+                            button { class: "header-icon-button", title: fl!("import-project"), aria_label: fl!("import-project"), disabled: !restored(),
                                 onclick: move |_| {
                                     // Open the picker inside the click handler so it still counts as a user gesture.
                                     let picking = browser::pick_file(browser::FileKind::Project);
@@ -1444,7 +1467,7 @@ fn App() -> Element {
                                                 PendingReplace::Load {
                                                     project: Box::new(project),
                                                     id: None,
-                                                    notice: "Project imported.".into(),
+                                                    notice: fl!("project-imported"),
                                                 },
                                                 doc,
                                                 pending_replace,
@@ -1456,9 +1479,9 @@ fn App() -> Element {
                         }
                         div { class: "library-list",
                             if !restored() {
-                                p { class: "library-empty", "Loading projects…" }
+                                p { class: "library-empty", {fl!("loading-projects")} }
                             } else if library().is_empty() {
-                                p { class: "library-empty", "No projects yet. Create a new project or import a project file." }
+                                p { class: "library-empty", {fl!("no-projects-yet-create-a-new-project")} }
                             } else {
                                 for entry in library() {
                                     div { class: if current_id().as_deref() == Some(entry.id.as_str()) { "library-row active" } else { "library-row" },
@@ -1470,13 +1493,13 @@ fn App() -> Element {
                                                 )
                                             },
                                             strong { "{entry.name}" }
-                                            span { "Edited {relative_time(entry.updated_at)}" }
+                                            span { {fl!("edited", time = relative_time(entry.updated_at))} }
                                         }
                                         div { class: "library-row-actions",
                                             if current_id().as_deref() == Some(entry.id.as_str()) {
-                                                span { class: "badge", "Current" }
+                                                span { class: "badge", {fl!("current")} }
                                             }
-                                            button { class: "header-icon-button", title: "Export {entry.name}", aria_label: "Export {entry.name} to a file",
+                                            button { class: "header-icon-button", title: fl!("export-2", name = entry.name.clone()), aria_label: fl!("export-to-a-file", name = entry.name.clone()),
                                                 onclick: {
                                                     let id = entry.id.clone();
                                                     let name = entry.name.clone();
@@ -1486,13 +1509,13 @@ fn App() -> Element {
                                                         spawn(async move {
                                                             match storage::load_project(&id).await {
                                                                 Ok(Some(bytes)) => export_project(bytes, &name, message),
-                                                                Ok(None) => message.set("That project is no longer in the library.".into()),
+                                                                Ok(None) => message.set(fl!("that-project-is-no-longer-in-the")),
                                                                 Err(error) => message.set(error),
                                                             }
                                                         });
                                                     }
                                                 }, {action_icon(EXPORT_ICON)} }
-                                            button { class: "header-icon-button", title: "Delete {entry.name}", aria_label: "Delete {entry.name}",
+                                            button { class: "header-icon-button", title: fl!("delete-2", name = entry.name.clone()), aria_label: fl!("delete-2", name = entry.name.clone()),
                                                 onclick: {
                                                     let entry = entry.clone();
                                                     move |_| deleting_project.set(Some(entry.clone()))
@@ -1502,22 +1525,22 @@ fn App() -> Element {
                                 }
                             }
                         }
-                        p { class: "library-footer", "Projects are kept in this app's local storage. Export a .folio.json copy for a backup or to open it on another device." }
+                        p { class: "library-footer", {fl!("projects-are-kept-in-this-app-s")} }
                     }
                 }
             }
             footer { class: "status-bar",
                 inert: deleting_project().is_some().then_some(""),
-                span { role: "status", aria_live: "polite", "{message}" }
+                span { role: "status", aria_live: "polite", {i18n::message(&message())} }
                 if busy {
                     button { class: "button outline", onclick: move |_| {
                         pending.set(None); bridge.set(None); worker_generation += 1;
-                        message.set("PDF operation cancelled. The worker has been restarted.".into());
-                    }, "Cancel operation" }
+                        message.set(fl!("pdf-operation-cancelled-the-worker-has-been"));
+                    }, {fl!("cancel-operation")} }
                 } else if bridge.read().is_none() {
-                    button { class: "button outline", onclick: move |_| worker_generation += 1, "Restart PDF worker" }
+                    button { class: "button outline", onclick: move |_| worker_generation += 1, {fl!("restart-pdf-worker")} }
                 }
-                span { class: "save-status", "{save_status}" }
+                span { class: "save-status", {i18n::message(&save_status())} }
             }
             if let Some(entry) = deleting_project() {
                 div { class: "library-backdrop", onclick: move |_| deleting_project.set(None),
@@ -1530,14 +1553,14 @@ fn App() -> Element {
                             }
                         },
                         header { class: "library-header",
-                            h2 { id: "delete-title", "Delete project?" }
+                            h2 { id: "delete-title", {fl!("delete-project")} }
                         }
                         div { class: "unsaved-body",
-                            p { id: "delete-description", "“{entry.name}” will be permanently removed from your library." }
+                            p { id: "delete-description", {fl!("will-be-permanently-removed-from-your-library", name = entry.name.clone())} }
                         }
                         div { class: "unsaved-actions",
                             button { class: "button quiet", autofocus: true,
-                                onclick: move |_| deleting_project.set(None), "Cancel" }
+                                onclick: move |_| deleting_project.set(None), {fl!("cancel")} }
                             button { class: "button outline danger",
                                 onclick: move |_| {
                                     let id = entry.id.clone();
@@ -1550,16 +1573,16 @@ fn App() -> Element {
                                                 if current_id.peek().as_deref() == Some(id.as_str()) {
                                                     adopt_project(blank_project(&doc.library.peek()), None, doc);
                                                     if let Err(error) = autosave(doc).await {
-                                                        save_status.set(format!("Autosave failed: {error}"));
+                                                        save_status.set(fl!("autosave-failed", error = error));
                                                     }
                                                 }
                                                 library.write().retain(|project| project.id != id);
-                                                message.set("Project deleted from your library.".into());
+                                                message.set(fl!("project-deleted-from-your-library"));
                                             }
                                             Err(error) => message.set(error),
                                         }
                                     });
-                                }, "Delete project" }
+                                }, {fl!("delete-project-2")} }
                         }
                     }
                 }
@@ -1570,13 +1593,13 @@ fn App() -> Element {
                         onclick: move |event: MouseEvent| event.stop_propagation(),
                         header { class: "library-header",
                             div {
-                                h2 { id: "unsaved-title", "Autosave could not finish" }
-                                p { "This project has changes that are not saved to your library." }
+                                h2 { id: "unsaved-title", {fl!("autosave-could-not-finish")} }
+                                p { {fl!("this-project-has-changes-that-are-not")} }
                             }
-                            button { class: "icon-button", aria_label: "Cancel", onclick: move |_| pending_replace.set(None), "×" }
+                            button { class: "icon-button", aria_label: fl!("cancel"), onclick: move |_| pending_replace.set(None), "×" }
                         }
                         div { class: "unsaved-body",
-                            p { "Retry autosave, discard the unsaved changes, or cancel." }
+                            p { {fl!("retry-autosave-discard-the-unsaved-changes-or")} }
                         }
                         div { class: "unsaved-actions",
                             button { class: "button primary", disabled: validation.is_some(),
@@ -1584,7 +1607,7 @@ fn App() -> Element {
                                     if let Some(action) = pending_replace.take() {
                                         request_replace(action, doc, pending_replace);
                                     }
-                                }, "Retry autosave" }
+                                }, {fl!("retry-autosave")} }
                             button { class: "button quiet",
                                 onclick: move |_| {
                                     if let Some(action) = pending_replace.take() {
@@ -1593,12 +1616,12 @@ fn App() -> Element {
                                             let _guard = lock.lock().await;
                                             apply_replace(action, doc);
                                             if let Err(error) = autosave(doc).await {
-                                                save_status.set(format!("Autosave failed: {error}"));
+                                                save_status.set(fl!("autosave-failed", error = error));
                                             }
                                         });
                                     }
-                                }, "Discard changes" }
-                            button { class: "button quiet", onclick: move |_| pending_replace.set(None), "Cancel" }
+                                }, {fl!("discard-changes")} }
+                            button { class: "button quiet", onclick: move |_| pending_replace.set(None), {fl!("cancel")} }
                         }
                     }
                 }
@@ -1609,7 +1632,7 @@ fn App() -> Element {
 
 #[component]
 fn SidebarSection(
-    title: &'static str,
+    title: String,
     mut open: Signal<bool>,
     #[props(default = "")] number: &'static str,
     #[props(default = 0)] badge: usize,
@@ -1620,7 +1643,7 @@ fn SidebarSection(
     // (after an artwork import) as well as by clicking or Enter/Space on its heading.
     rsx! {
         details { class: "panel {class}", open: open(),
-            summary { class: "panel-summary", draggable: "true", title: "Click to expand or collapse · drag to swap places",
+            summary { class: "panel-summary", draggable: "true", title: fl!("click-to-expand-or-collapse-drag-to"),
                 onclick: move |event| {
                     event.prevent_default();
                     open.toggle();
@@ -1643,7 +1666,7 @@ fn SidebarSection(
 
 #[component]
 fn NumberInput(
-    label: &'static str,
+    label: String,
     value: f64,
     min: f64,
     max: f64,
@@ -1653,7 +1676,7 @@ fn NumberInput(
 ) -> Element {
     rsx! {
         label { class: "control", span { "{label}" }
-            input { r#type: "number", aria_label: "{label}", value: if mixed { String::new() } else { value.to_string() }, placeholder: "Mixed", min: "{min}", max: "{max}", step: "{step}",
+            input { r#type: "number", aria_label: "{label}", value: if mixed { String::new() } else { value.to_string() }, placeholder: fl!("mixed"), min: "{min}", max: "{max}", step: "{step}",
                 onchange: move |event| {
                     if let Ok(value) = event.value().parse::<f64>()
                         && value.is_finite() {
@@ -1668,14 +1691,14 @@ fn NumberInput(
 /// The sidebar panes, left sidebar first, each in display order.
 type PaneOrder = (Vec<&'static str>, Vec<&'static str>);
 
-fn pane_title(id: &str) -> &'static str {
+fn pane_title(id: &str) -> String {
     match id {
-        "artwork" => "Artwork & paper",
-        "sequence" => "Number sequence",
-        "layout" => "Sheet layout",
-        "fields" => "Number fields",
-        "props" => "Field properties",
-        _ => "Export your job",
+        "artwork" => fl!("artwork-paper"),
+        "sequence" => fl!("number-sequence"),
+        "layout" => fl!("sheet-layout"),
+        "fields" => fl!("number-fields"),
+        "props" => fl!("field-properties"),
+        _ => fl!("export-your-job"),
     }
 }
 
@@ -1724,7 +1747,7 @@ fn PaneSlot(
         None => "pane-slot",
     };
     let swap_label = active
-        .map(|from| format!("Swap with {}", pane_title(from)))
+        .map(|from| fl!("swap-with", pane = pane_title(from)))
         .unwrap_or_default();
     rsx! {
         div { class: "{class}", "data-pane": "{id}", "data-swap": "{swap_label}",

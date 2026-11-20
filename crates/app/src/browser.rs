@@ -1,5 +1,7 @@
 //! Platform glue: native dialogs and WebView DOM access for the desktop build, and
 //! the equivalent browser APIs for the web build. Callers stay platform-agnostic.
+#[cfg(not(target_arch = "wasm32"))]
+use crate::fl;
 use std::{cell::RefCell, collections::HashSet, future::Future, pin::Pin};
 
 thread_local! {
@@ -49,20 +51,20 @@ impl FileKind {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn title(self) -> &'static str {
+    fn title(self) -> String {
         match self {
-            Self::Artwork => "Choose artwork",
-            Self::Font => "Choose a font",
-            Self::Project => "Open a project",
+            Self::Artwork => fl!("choose-artwork"),
+            Self::Font => fl!("choose-a-font"),
+            Self::Project => fl!("open-a-project"),
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn filter_name(self) -> &'static str {
+    fn filter_name(self) -> String {
         match self {
-            Self::Artwork => "Artwork",
-            Self::Font => "Font",
-            Self::Project => "Folio project",
+            Self::Artwork => fl!("artwork"),
+            Self::Font => fl!("font"),
+            Self::Project => fl!("folio-project"),
         }
     }
 
@@ -495,7 +497,7 @@ mod platform {
         }
         dialog = match mime {
             "application/pdf" => dialog.add_filter("PDF", &["pdf"]),
-            _ => dialog.add_filter("Folio project", &["json", "folio"]),
+            _ => dialog.add_filter(crate::fl!("folio-project"), &["json", "folio"]),
         };
         let Some(handle) = dialog.save_file().await else {
             return Ok(false);
