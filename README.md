@@ -68,6 +68,15 @@ host and serve `.wasm` as `application/wasm`. Use HTTPS in production.
 - **Headers:** no cross-origin isolation headers are needed; the worker is
   single-threaded and uses no shared memory.
 
+### Deploy with GitHub Pages
+
+The [Pages workflow](.github/workflows/pages.yml) publishes Folio on pushes to
+`main` and on manual runs. In repository **Settings → Pages**, select
+**GitHub Actions** as the source. The workflow uses the configured Pages base
+path so assets and the PDF worker load beneath the repository URL, including
+`https://hx-software.github.io/folio/`. A custom domain can be configured in
+the same settings. Projects stay in each browser's local storage.
+
 ### Deploy with Dokploy
 
 Create a Dokploy **Application** and connect the branch that contains the
