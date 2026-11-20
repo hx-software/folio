@@ -8,6 +8,51 @@ use i18n_embed::{
 };
 use rust_embed::RustEmbed;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LanguagePreference {
+    #[default]
+    System,
+    English,
+    SpanishMexico,
+}
+
+impl LanguagePreference {
+    pub fn value(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::English => "en",
+            Self::SpanishMexico => "es-MX",
+        }
+    }
+
+    pub fn from_value(value: &str) -> Self {
+        match value {
+            "en" => Self::English,
+            "es-MX" => Self::SpanishMexico,
+            _ => Self::System,
+        }
+    }
+}
+
+pub fn select_language(preference: LanguagePreference) {
+    let requested = match preference {
+        LanguagePreference::System => {
+            #[cfg(not(target_arch = "wasm32"))]
+            let languages = i18n_embed::DesktopLanguageRequester::requested_languages();
+            #[cfg(target_arch = "wasm32")]
+            let languages = i18n_embed::WebLanguageRequester::requested_languages();
+            languages
+        }
+        preference => vec![
+            preference
+                .value()
+                .parse()
+                .expect("Valid language preference"),
+        ],
+    };
+    init(&requested);
+}
+
 pub fn init(requested_languages: &[LanguageIdentifier]) {
     if let Err(error) = localizer().select(requested_languages) {
         crate::browser::log_warn(&format!("Error loading Fluent localizations: {error}"));

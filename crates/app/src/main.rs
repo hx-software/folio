@@ -108,11 +108,7 @@ fn main() {
     #[cfg(target_arch = "wasm32")]
     console_error_panic_hook::set_once();
 
-    #[cfg(not(target_arch = "wasm32"))]
-    let requested_languages = i18n_embed::DesktopLanguageRequester::requested_languages();
-    #[cfg(target_arch = "wasm32")]
-    let requested_languages = i18n_embed::WebLanguageRequester::requested_languages();
-    i18n::init(&requested_languages);
+    i18n::select_language(i18n::LanguagePreference::System);
 
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -425,6 +421,7 @@ fn relative_time(updated_at: u64) -> String {
 const NEW_ICON: &str = "M12 5v14M5 12h14";
 const IMPORT_ICON: &str = "M12 16V4m-4 4 4-4 4 4M5 15v5h14v-5";
 const EXPORT_ICON: &str = "M12 4v12m-4-4 4 4 4-4M5 16v4h14v-4";
+const SETTINGS_ICON: &str = "M4 7h9m4 0h3M4 17h3m4 0h9M13 4v6M7 14v6";
 const DELETE_ICON: &str = "M4 7h16m-14 0 1 13h10l1-13M9 7V4h6v3m-5 3v7m4-7v7";
 
 fn action_icon(path_data: &str) -> Element {
@@ -439,12 +436,25 @@ fn action_icon(path_data: &str) -> Element {
 
 #[component]
 fn App() -> Element {
-    use_future(move || async move {
+    let mut language = use_context_provider(|| Signal::new(i18n::LanguagePreference::System));
+    let _current_language = language();
+    let mut language_loaded = use_signal(|| false);
+    let mut language_saving = use_signal(|| false);
+    let mut settings_open = use_signal(|| false);
+    let mut settings_error = use_signal(String::new);
+    use_effect(move || {
+        let _ = language();
         use i18n_embed::LanguageLoader;
-        let language = i18n::LANGUAGE_LOADER.current_language();
-        let _ = document::eval(&format!("document.documentElement.lang = '{language}';"))
+        let language_tag = i18n::LANGUAGE_LOADER.current_language();
+        #[cfg(not(target_arch = "wasm32"))]
+        dioxus::desktop::window().set_title(&fl!("folio-precise-numbering"));
+        spawn(async move {
+            let _ = document::eval(&format!(
+                "document.documentElement.lang = '{language_tag}';"
+            ))
             .join::<()>()
             .await;
+        });
     });
     let mut editor = use_signal(Editor::default);
     let mut message = use_signal(|| fl!("your-files-stay-on-this-device"));
@@ -704,6 +714,16 @@ fn App() -> Element {
     });
 
     use_future(move || async move {
+        match storage::load_language().await {
+            Ok(value) => {
+                let preference =
+                    i18n::LanguagePreference::from_value(value.as_deref().unwrap_or("system"));
+                i18n::select_language(preference);
+                language.set(preference);
+            }
+            Err(error) => settings_error.set(error),
+        }
+        language_loaded.set(true);
         match storage::list_projects().await {
             Ok(entries) => library.set(entries),
             Err(error) => message.set(error),
@@ -1162,7 +1182,7 @@ fn App() -> Element {
         document::Stylesheet { href: asset!("/assets/styles.css") }
         div { class: "app-shell",
             if !library_open() {
-            header { class: "app-header",
+            header { class: "app-header", inert: settings_open().then_some(""),
                 button { class: "header-icon-button", aria_label: fl!("project-library"), title: fl!("project-library"), disabled: !restored(),
                     onclick: move |_| {
                         library_open.set(true);
@@ -1193,6 +1213,8 @@ fn App() -> Element {
                     button { class: "button outline", aria_expanded: mobile_panel() == Some("fields"), onclick: move |_| mobile_panel.set(if mobile_panel() == Some("fields") { None } else { Some("fields") }), {fl!("fields")} }
                 }
                 div { class: "header-actions",
+                    button { class: "header-icon-button", title: fl!("app-settings"), aria_label: fl!("app-settings"),
+                        onclick: move |_| settings_open.set(true), {action_icon(SETTINGS_ICON)} }
                     button { class: "button quiet", aria_label: fl!("export-project-to-a-file"), disabled: !restored() || validation.is_some(),
                         onclick: move |_| {
                             let (bytes, name) = {
@@ -1209,7 +1231,7 @@ fn App() -> Element {
                         {fl!("new-project-short")} span { class: "action-detail", {fl!("new-project-detail")} } }
                 }
             }
-            main { class: "workspace", aria_busy: !restored(),
+            main { class: "workspace", aria_busy: !restored(), inert: settings_open().then_some(""),
                 if mobile_panel().is_some() {
                     button { class: "sidebar-backdrop", aria_label: fl!("close-sidebar"), onclick: move |_| mobile_panel.set(None) }
                 }
@@ -1429,14 +1451,18 @@ fn App() -> Element {
             }
             if library_open() {
                 main { class: "library-view", aria_labelledby: "library-title", aria_busy: !restored(),
-                    inert: (deleting_project().is_some() || pending_replace().is_some()).then_some(""),
+                    inert: (deleting_project().is_some() || pending_replace().is_some() || settings_open()).then_some(""),
                     div { class: "library-content",
                         header { class: "library-header",
                             div {
                                 h1 { id: "library-title", {fl!("project-library")} }
                                 p { {fl!("saved-inside-folio-on-this-device")} }
                             }
+                            div { class: "library-header-actions",
+                                button { class: "header-icon-button", title: fl!("app-settings"), aria_label: fl!("app-settings"),
+                                    onclick: move |_| settings_open.set(true), {action_icon(SETTINGS_ICON)} }
                             button { class: "button outline", disabled: !restored(), onclick: move |_| library_open.set(false), {fl!("back-to-editor")} }
+                            }
                         }
                         div { class: "library-actions",
                             button { class: "header-icon-button", title: fl!("new-project"), aria_label: fl!("new-project"), disabled: !restored(),
@@ -1530,7 +1556,7 @@ fn App() -> Element {
                 }
             }
             footer { class: "status-bar",
-                inert: deleting_project().is_some().then_some(""),
+                inert: (deleting_project().is_some() || settings_open()).then_some(""),
                 span { role: "status", aria_live: "polite", {i18n::message(&message())} }
                 if busy {
                     button { class: "button outline", onclick: move |_| {
@@ -1541,6 +1567,55 @@ fn App() -> Element {
                     button { class: "button outline", onclick: move |_| worker_generation += 1, {fl!("restart-pdf-worker")} }
                 }
                 span { class: "save-status", {i18n::message(&save_status())} }
+            }
+            if settings_open() {
+                div { class: "library-backdrop settings-backdrop", onclick: move |_| settings_open.set(false),
+                    section { class: "settings-pane", role: "dialog", aria_modal: "true", aria_labelledby: "settings-title",
+                        onclick: move |event: MouseEvent| event.stop_propagation(),
+                        onkeydown: move |event: KeyboardEvent| {
+                            if event.key() == Key::Escape { settings_open.set(false); }
+                        },
+                        header { class: "library-header",
+                            h2 { id: "settings-title", {fl!("app-settings")} }
+                            button { class: "icon-button", autofocus: true, aria_label: fl!("close-settings"),
+                                onclick: move |_| settings_open.set(false), "×" }
+                        }
+                        div { class: "settings-body",
+                            label { class: "control",
+                                span { {fl!("interface-language")} }
+                                select { aria_label: fl!("interface-language"), value: language().value(),
+                                    disabled: !language_loaded() || language_saving(),
+                                    onchange: move |event| {
+                                        let preference = i18n::LanguagePreference::from_value(&event.value());
+                                        language_saving.set(true);
+                                        settings_error.set(String::new());
+                                        spawn(async move {
+                                            match storage::save_language(preference.value()).await {
+                                                Ok(()) => {
+                                                    i18n::select_language(preference);
+                                                    language.set(preference);
+                                                    message.set(fl!("language-updated"));
+                                                    save_status.set(if *saved_revision.peek() == Some(editor.peek().revision) {
+                                                        fl!("autosaved-to-library")
+                                                    } else { fl!("saving") });
+                                                }
+                                                Err(error) => settings_error.set(error),
+                                            }
+                                            language_saving.set(false);
+                                        });
+                                    },
+                                    option { value: "system", {fl!("language-system")} }
+                                    option { value: "en", "English" }
+                                    option { value: "es-MX", "Español (México)" }
+                                }
+                            }
+                            p { class: "help", {fl!("language-preference-help")} }
+                            if !settings_error().is_empty() {
+                                p { class: "settings-error", role: "alert", {fl!("language-preference-error", error = settings_error())} }
+                            }
+                        }
+                    }
+                }
             }
             if let Some(entry) = deleting_project() {
                 div { class: "library-backdrop", onclick: move |_| deleting_project.set(None),
@@ -1639,6 +1714,7 @@ fn SidebarSection(
     #[props(default = "")] class: &'static str,
     children: Element,
 ) -> Element {
+    let _language = use_context::<Signal<i18n::LanguagePreference>>()();
     // The open state lives in Rust, so a section can be collapsed programmatically
     // (after an artwork import) as well as by clicking or Enter/Space on its heading.
     rsx! {
@@ -1674,6 +1750,7 @@ fn NumberInput(
     #[props(default = false)] mixed: bool,
     onchange: EventHandler<f64>,
 ) -> Element {
+    let _language = use_context::<Signal<i18n::LanguagePreference>>()();
     rsx! {
         label { class: "control", span { "{label}" }
             input { r#type: "number", aria_label: "{label}", value: if mixed { String::new() } else { value.to_string() }, placeholder: fl!("mixed"), min: "{min}", max: "{max}", step: "{step}",
@@ -1739,6 +1816,7 @@ fn PaneSlot(
     mut order: Signal<PaneOrder>,
     children: Element,
 ) -> Element {
+    let _language = use_context::<Signal<i18n::LanguagePreference>>()();
     let active = dragging();
     let class = match active {
         Some(from) if from == id => "pane-slot is-dragging",

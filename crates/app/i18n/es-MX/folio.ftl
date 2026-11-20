@@ -245,3 +245,12 @@ sheet-count-label =
         [one] hoja
        *[other] hojas
     }
+
+# Application settings
+app-settings = Configuración de la aplicación
+close-settings = Cerrar configuración
+interface-language = Idioma
+language-system = Usar el idioma del sistema
+language-preference-help = Los cambios de idioma se aplican al instante y se guardan en este dispositivo.
+language-updated = Preferencia de idioma actualizada.
+language-preference-error = No se pudo guardar la preferencia de idioma: { $error }

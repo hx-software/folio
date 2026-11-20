@@ -241,3 +241,12 @@ sheet-count-label =
         [one] sheet
        *[other] sheets
     }
+
+# Application settings
+app-settings = Application settings
+close-settings = Close settings
+interface-language = Language
+language-system = Follow system
+language-preference-help = Language changes apply immediately and are saved on this device.
+language-updated = Language preference updated.
+language-preference-error = Could not save the language preference: { $error }

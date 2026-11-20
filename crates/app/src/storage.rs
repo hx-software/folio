@@ -227,6 +227,22 @@ mod platform {
         result
     }
 
+    pub async fn load_language() -> Result<Option<String>, String> {
+        let db = open().await?;
+        let result = get_key(&db, "language").await;
+        db.close();
+        result?
+            .map(|bytes| String::from_utf8(bytes).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    pub async fn save_language(language: &str) -> Result<(), String> {
+        let db = open().await?;
+        let result = put_key(&db, "language", language.as_bytes()).await;
+        db.close();
+        result
+    }
+
     pub async fn load_current_id() -> Result<Option<String>, String> {
         let db = open().await?;
         let result = get_key(&db, AUTOSAVE_ID).await;
@@ -414,6 +430,22 @@ mod platform {
         .await?
     }
 
+    pub async fn load_language() -> Result<Option<String>, String> {
+        let path = app_dir()?.join("language");
+        run_blocking(move || match std::fs::read_to_string(path) {
+            Ok(language) => Ok(Some(language)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("Cannot read language preference: {error}")),
+        })
+        .await?
+    }
+
+    pub async fn save_language(language: &str) -> Result<(), String> {
+        let path = app_dir()?.join("language");
+        let bytes = language.as_bytes().to_vec();
+        run_blocking(move || write_atomic(&path, &bytes)).await?
+    }
+
     pub async fn load_current_id() -> Result<Option<String>, String> {
         let path = current_id_path()?;
         run_blocking(move || match std::fs::read(&path) {
@@ -559,6 +591,15 @@ mod platform {
         #[test]
         fn library_round_trips_and_keeps_one_entry_per_id() {
             let _data = TestDataDir::new("library");
+
+            assert_eq!(block_on(load_language()).unwrap(), None);
+            block_on(save_language("es-MX")).unwrap();
+            assert_eq!(block_on(load_language()).unwrap().as_deref(), Some("es-MX"));
+            block_on(save_language("system")).unwrap();
+            assert_eq!(
+                block_on(load_language()).unwrap().as_deref(),
+                Some("system")
+            );
 
             for id in ["", "../escape", "a/b", "a b"] {
                 assert!(library_path(id).is_err(), "{id:?} should be rejected");
