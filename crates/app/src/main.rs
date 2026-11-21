@@ -462,6 +462,28 @@ fn App() -> Element {
     let mut restored = use_signal(|| false);
     let mut library_open = use_signal(|| true);
     let mut library = use_signal(Vec::<storage::ProjectSummary>::new);
+    let mut library_search = use_signal(String::new);
+    let mut library_order = use_signal(|| String::from("recent"));
+    let filtered_projects = use_memo(move || {
+        let query = library_search.read().trim().to_lowercase();
+        let mut projects = library
+            .read()
+            .iter()
+            .filter(|project| project.name.to_lowercase().contains(&query))
+            .cloned()
+            .collect::<Vec<_>>();
+        let order = library_order.read();
+        projects.sort_by(|a, b| {
+            let comparison = match order.as_str() {
+                "oldest" => a.updated_at.cmp(&b.updated_at),
+                "name-ascending" => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                "name-descending" => b.name.to_lowercase().cmp(&a.name.to_lowercase()),
+                _ => b.updated_at.cmp(&a.updated_at),
+            };
+            comparison.then_with(|| a.id.cmp(&b.id))
+        });
+        projects
+    });
     let current_id = use_signal(|| None::<String>);
     let save_lock = use_signal(|| Rc::new(futures_util::lock::Mutex::new(())));
     let saved_revision = use_signal(|| None::<u64>);
@@ -1502,15 +1524,37 @@ fn App() -> Element {
                                         }
                                     });
                                 }, {action_icon(IMPORT_ICON)} }
+                            label { class: "control library-order",
+                                select { aria_label: fl!("library-order"), value: "{library_order}",
+                                    disabled: !restored(),
+                                    onchange: move |event| library_order.set(event.value()),
+                                    option { value: "recent", {fl!("library-order-recent")} }
+                                    option { value: "oldest", {fl!("library-order-oldest")} }
+                                    option { value: "name-ascending", {fl!("library-order-name-ascending")} }
+                                    option { value: "name-descending", {fl!("library-order-name-descending")} }
+                                }
+                            }
+                            label { class: "control library-search",
+                                input { r#type: "search", aria_label: fl!("search-projects"),
+                                    placeholder: fl!("search-projects-placeholder"), value: "{library_search}",
+                                    disabled: !restored(),
+                                    oninput: move |event| library_search.set(event.value()),
+                                    onkeydown: move |event: KeyboardEvent| {
+                                        if event.key() == Key::Escape { library_search.set(String::new()); }
+                                    }
+                                }
+                            }
                         }
-                        div { class: "library-list",
+                        div { class: "library-list", aria_live: "polite",
                             if !restored() {
                                 p { class: "library-empty", {fl!("loading-projects")} }
                             } else if library().is_empty() {
                                 p { class: "library-empty", {fl!("no-projects-yet-create-a-new-project")} }
+                            } else if filtered_projects().is_empty() {
+                                p { class: "library-empty", {fl!("search-projects-empty")} }
                             } else {
-                                for entry in library() {
-                                    div { class: if current_id().as_deref() == Some(entry.id.as_str()) { "library-row active" } else { "library-row" },
+                                for entry in filtered_projects() {
+                                    div { key: "{entry.id}", class: if current_id().as_deref() == Some(entry.id.as_str()) { "library-row active" } else { "library-row" },
                                         button { class: "library-open",
                                             onclick: {
                                                 let id = entry.id.clone();

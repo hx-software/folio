@@ -355,3 +355,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, svg:focus-visib
   .settings-pane { background: var(--surface); }
   .settings-error { color: #ffb3ac; }
 }
+
+.library-search { flex: 1; max-width: 360px; min-width: min(220px, 100%); margin: 0; }
+.library-search input { width: 100%; }
+@media (max-width: 600px) {
+  .library-search { flex-basis: 100%; max-width: none; }
+}
+.library-view .library-actions { align-items: center; }
+.library-order { margin: 0 0 0 auto; }
+.library-order select { max-width: 100%; }

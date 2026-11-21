@@ -250,3 +250,15 @@ language-system = Follow system
 language-preference-help = Language changes apply immediately and are saved on this device.
 language-updated = Language preference updated.
 language-preference-error = Could not save the language preference: { $error }
+
+# Library search
+search-projects = Search projects
+search-projects-placeholder = Search by project name…
+search-projects-empty = No projects match your search.
+
+# Library ordering
+library-order = Order projects
+library-order-recent = Recently edited
+library-order-oldest = Oldest edited
+library-order-name-ascending = Name · A–Z
+library-order-name-descending = Name · Z–A

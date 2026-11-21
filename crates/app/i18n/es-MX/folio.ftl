@@ -254,3 +254,15 @@ language-system = Usar el idioma del sistema
 language-preference-help = Los cambios de idioma se aplican al instante y se guardan en este dispositivo.
 language-updated = Preferencia de idioma actualizada.
 language-preference-error = No se pudo guardar la preferencia de idioma: { $error }
+
+# Library search
+search-projects = Buscar proyectos
+search-projects-placeholder = Buscar por nombre del proyecto…
+search-projects-empty = Ningún proyecto coincide con tu búsqueda.
+
+# Library ordering
+library-order = Ordenar proyectos
+library-order-recent = Edición más reciente
+library-order-oldest = Edición más antigua
+library-order-name-ascending = Nombre · A–Z
+library-order-name-descending = Nombre · Z–A
